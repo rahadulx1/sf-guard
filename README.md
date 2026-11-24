@@ -2,11 +2,41 @@
 
 A Claude Code mod for Salesforce developers. It guards production orgs, shows which org you are in, keeps a live sidebar of the files Claude changes, and makes sf CLI output easy to read.
 
+## Install
+
+Requires Claude Code 2.1.287 or later (`claude --version`), `git`, and the Salesforce CLI (`sf`).
+
+From your terminal:
+
+```bash
+claude plugin marketplace add rahadulx1/claude-mods
+claude plugin install sf-guardian@rahadul-mods
+echo '{"prod_orgs":"your-prod-alias, admin@yourcompany.com"}' | claude plugin configure sf-guardian@rahadul-mods --values-stdin
+```
+
+Or inside Claude Code:
+
+```
+/plugin marketplace add rahadulx1/claude-mods
+/plugin install sf-guardian@rahadul-mods
+```
+
+Then restart Claude Code, start it from inside your Salesforce project folder, and type `/sffiles`.
+
+## Update
+
+```bash
+claude plugin marketplace update rahadul-mods
+claude plugin update sf-guardian@rahadul-mods
+```
+
+Restart Claude Code afterwards. Your settings are kept. To update automatically, open `/plugin`, choose **Marketplaces**, select `rahadul-mods`, and choose **Enable auto-update**.
+
 ## Settings
 
 Set these in Claude Code with `/config` (look for SF Guardian), or from your shell:
 
-    echo '{"prod_orgs":"prod, admin@acme.com"}' | claude plugin configure sf-guardian@my-mods --values-stdin
+    echo '{"prod_orgs":"prod, admin@acme.com"}' | claude plugin configure sf-guardian@rahadul-mods --values-stdin
 
 | Setting | What it does | Default |
 | --- | --- | --- |
