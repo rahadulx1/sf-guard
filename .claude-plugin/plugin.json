@@ -1,0 +1,50 @@
+{
+  "name": "sf-guardian",
+  "displayName": "SF Guardian",
+  "version": "0.5.0",
+  "description": "Salesforce helper for Claude Code: production deploy guard, org badge, live Files sidebar with diffs, compact sf rows and test summaries, Apex test tracking, coverage, and org limits",
+  "author": { "name": "Rahadul" },
+  "license": "MIT",
+  "userConfig": {
+    "prod_orgs": {
+      "type": "string",
+      "title": "Production orgs",
+      "description": "Aliases or usernames of your production orgs, separated by commas (for example: prod, admin@acme.com). Deploys and data changes aimed at these ask first.",
+      "default": ""
+    },
+    "auto_open_files": {
+      "type": "boolean",
+      "title": "Open the Files sidebar automatically",
+      "description": "Open the live Files sidebar the first time a file changes in a session.",
+      "default": true
+    },
+    "files_pane_width": {
+      "type": "number",
+      "title": "Files sidebar width",
+      "description": "Width of the Files sidebar in terminal columns.",
+      "default": 72,
+      "min": 40,
+      "max": 160
+    },
+    "compact_sf_rows": {
+      "type": "boolean",
+      "title": "Compact sf command rows",
+      "description": "Draw sf deploys and Apex test runs as short rows with a summary. Ctrl+O still shows everything.",
+      "default": true
+    },
+    "show_band": {
+      "type": "boolean",
+      "title": "Org status above the prompt",
+      "description": "Show the org badge, untested Apex, changed files and the last deploy above the prompt.",
+      "default": true
+    },
+    "coverage_target": {
+      "type": "number",
+      "title": "Coverage target (%)",
+      "description": "Coverage at or above this shows green. Below 75% shows red.",
+      "default": 85,
+      "min": 75,
+      "max": 100
+    }
+  }
+}

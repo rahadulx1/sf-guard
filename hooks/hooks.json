@@ -1,0 +1,4 @@
+{
+  "description": "sf-guardian hooks module",
+  "modules": ["./register.js"]
+}
