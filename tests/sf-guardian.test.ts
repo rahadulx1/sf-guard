@@ -46,15 +46,23 @@ function project(on: any, disk: Record<string, string>, opts: { cwd?: string; gi
   const touch = (p: string) => (mtime[p] = ++clock)
   for (const p of Object.keys(disk)) touch(p)
   const state = { porcelain: '', recent: [] as string[], head: {} as Record<string, string>, toasts: [] as string[] }
+  // On Windows the engine hands fs hooks D:\\project\\x for /project/x: match both spellings
+  const key = (p: string) => {
+    const f = String(p).replace(/\\/g, '/')
+    if (f in disk) return f
+    const m = f.match(/^[A-Za-z]:(\/.*)$/)
+    return m && m[1] in disk ? m[1] : m && !Object.keys(disk).some((k) => /^[A-Za-z]:/.test(k)) ? m[1] : f
+  }
   on('session.cwd', () => ({ value: cwd }))
   on('env.get', () => ({ value: '/Users/me' }))
-  on('fs.exists', ($$: any, e: any) => ({ value: e.path in disk }))
+  on('fs.exists', ($$: any, e: any) => ({ value: key(e.path) in disk }))
   on('fs.read', ($$: any, e: any) => {
-    if (!(e.path in disk)) throw new Error('ENOENT: ' + e.path)
-    return { value: disk[e.path] }
+    const k = key(e.path)
+    if (!(k in disk)) throw new Error('ENOENT: ' + e.path)
+    return { value: disk[k] }
   })
   on('fs.list', ($$: any, e: any) => {
-    const dir = String(e.path ?? cwd).replace(/\/$/, '')
+    const dir = key(String(e.path ?? cwd)).replace(/\/$/, '')
     const seen = new Map<string, any>()
     for (const p of Object.keys(disk)) {
       if (!p.startsWith(dir + '/')) continue
@@ -66,13 +74,15 @@ function project(on: any, disk: Record<string, string>, opts: { cwd?: string; gi
     return { value: [...seen.values()] }
   })
   on('fs.write', ($$: any, e: any) => {
-    disk[e.path] = e.text
-    touch(e.path)
+    const k = key(e.path)
+    disk[k] = e.text
+    touch(k)
     return { value: undefined }
   })
   on('fs.stat', ($$: any, e: any) => {
-    if (!(e.path in disk)) throw new Error('ENOENT: ' + e.path)
-    return { value: { kind: 'file', size: disk[e.path].length, mtimeMs: mtime[e.path] ?? 0, isLink: false } }
+    const k = key(e.path)
+    if (!(k in disk)) throw new Error('ENOENT: ' + e.path)
+    return { value: { kind: 'file', size: disk[k].length, mtimeMs: mtime[k] ?? 0, isLink: false } }
   })
   on('process.run', ($$: any, e: any) => {
     const argv = e.argv.join(' ')
