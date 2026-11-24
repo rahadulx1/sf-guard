@@ -1,21 +1,69 @@
 {
   "name": "sf-guardian",
   "displayName": "SF Guardian",
-  "version": "0.5.0",
-  "description": "Salesforce helper for Claude Code: production deploy guard, org badge, live Files sidebar with diffs, compact sf rows and test summaries, Apex test tracking, coverage, and org limits",
-  "author": { "name": "Rahadul" },
+  "version": "0.9.0",
+  "description": "Salesforce helper for Claude Code: a production guard that detects your orgs, live Files sidebar that shows code as Claude writes it, deploy and test failures with file and line, validate changed files, coverage, Code Analyzer, audit log, and /sfdoctor",
+  "author": {
+    "name": "Rahadul"
+  },
   "license": "MIT",
   "userConfig": {
     "prod_orgs": {
       "type": "string",
       "title": "Production orgs",
-      "description": "Aliases or usernames of your production orgs, separated by commas (for example: prod, admin@acme.com). Deploys and data changes aimed at these ask first.",
+      "description": "Aliases or usernames that are always production, separated by commas. Orgs are also detected from sf org list; this list wins over detection.",
       "default": ""
+    },
+    "safe_orgs": {
+      "type": "string",
+      "title": "Safe orgs (never production)",
+      "description": "Aliases or usernames that are never production, separated by commas: Developer Edition and trial orgs, which sf lists like production.",
+      "default": ""
+    },
+    "guard_mode": {
+      "type": "string",
+      "title": "Guard mode",
+      "description": "ask: changes to production or unknown orgs ask first. block: they are refused, and only reads go through.",
+      "default": "ask",
+      "options": [
+        "ask",
+        "block"
+      ]
+    },
+    "guard_scripts": {
+      "type": "boolean",
+      "title": "Guard scripts",
+      "description": "Look inside npm scripts, make and shell scripts for sf commands. A script that cannot be read asks while the default org is production or unknown.",
+      "default": true
+    },
+    "guard_mcp": {
+      "type": "boolean",
+      "title": "Guard Salesforce MCP tools",
+      "description": "deploy_metadata, assign_permission_set, delete_org and resume_tool_operation ask first on production or unknown orgs.",
+      "default": true
+    },
+    "allow_secret_commands": {
+      "type": "boolean",
+      "title": "Allow secret commands",
+      "description": "Let Claude run sf org auth show-access-token, show-sfdx-auth-url and show-user-password, which print secrets into the conversation.",
+      "default": false
+    },
+    "audit_log": {
+      "type": "boolean",
+      "title": "Audit log",
+      "description": "Keep a local record of the last 500 guarded commands (cleaned of secrets). See /sfguard. Nothing is sent anywhere.",
+      "default": true
     },
     "auto_open_files": {
       "type": "boolean",
       "title": "Open the Files sidebar automatically",
       "description": "Open the live Files sidebar the first time a file changes in a session.",
+      "default": true
+    },
+    "live_typing": {
+      "type": "boolean",
+      "title": "Live typing in the Files sidebar",
+      "description": "Show a file's text while Claude writes it, before it is saved. Drafts stay in memory only.",
       "default": true
     },
     "files_pane_width": {
@@ -45,6 +93,30 @@
       "default": 85,
       "min": 75,
       "max": 100
+    },
+    "code_analyzer": {
+      "type": "boolean",
+      "title": "Run Code Analyzer",
+      "description": "After a turn that changed Apex or LWC, run sf code-analyzer on the changed files. Needs the code-analyzer plugin (and Java for some engines).",
+      "default": false
+    },
+    "editor_command": {
+      "type": "string",
+      "title": "Editor command",
+      "description": "Editor for the o key in the Files sidebar. Runs <command> -g <file>:<line>, or use {file} and {line} placeholders, for example: idea --line {line} {file}",
+      "default": "code"
+    },
+    "notify": {
+      "type": "boolean",
+      "title": "Notify when deploys and tests end",
+      "description": "Send a system notification when a deploy, validation or test run finishes.",
+      "default": false
+    },
+    "remember_files": {
+      "type": "boolean",
+      "title": "Remember the file list",
+      "description": "Keep the Files sidebar list (paths and counts, never content) across restarts, per folder.",
+      "default": false
     }
   }
 }
