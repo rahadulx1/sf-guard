@@ -26,6 +26,9 @@ import { classifyOrgs, compareApi, daysUntil, needsAsk, orgClass, orgEntry, slim
 import { CATEGORY_LABEL, applyDryRun, changesLogins, choicesFor, decide, mcpToolOf, questionFor, scriptRefOf, sfCommandOf } from './lib/guard.js'
 import { componentOf, lintSource, namingProblem, soqlFields } from './lib/lint.js'
 import { normalizePrefix, standardsText } from './lib/standards.js'
+import { deployScope, manifestXml, memberOf, retrieveArgs, sameText, typeFolderTail } from './lib/metadata.js'
+import { isPermissionFile, permissionChanges } from './lib/permissions.js'
+import { POLICY_FILE, mergePolicy, parsePolicy, policySummary } from './lib/policy.js'
 import {
   failureLine,
   isUnknownCommand,
@@ -64,10 +67,15 @@ const cfg = {
   codingStandards: true,
   namePrefix: '',
   codeChecks: true,
+  backupBeforeDeploy: true,
 }
+let personal = { ...cfg }
+let teamPolicy = null
+let teamNote = ''
+const backups = []
 const COVERAGE_MIN = 75
 const MIN_CLAUDE = '2.1.287'
-let modVersion = '0.10.0' // read from plugin.json at session start; this is the fallback
+let modVersion = '0.11.0' // read from plugin.json at session start; this is the fallback
 
 const PANE = 'sf-guardian'
 const FILES_PANE = 'sf-files'
@@ -187,6 +195,7 @@ function applyOptions(options) {
   bool('remember_files', 'rememberFiles')
   bool('coding_standards', 'codingStandards')
   bool('code_checks', 'codeChecks')
+  bool('backup_before_deploy', 'backupBeforeDeploy')
   cfg.namePrefix = normalizePrefix(o.name_prefix)
   const width = Number(o.files_pane_width)
   if (Number.isFinite(width) && width >= 40) cfg.filesPaneWidth = Math.min(160, Math.round(width))
@@ -194,11 +203,33 @@ function applyOptions(options) {
   if (Number.isFinite(target)) cfg.coverageTarget = Math.max(COVERAGE_MIN, Math.min(100, target))
   if (o.guard_mode === 'block' || o.guard_mode === 'ask') cfg.guardMode = o.guard_mode
   if (typeof o.editor_command === 'string' && o.editor_command.trim()) cfg.editorCommand = o.editor_command.trim()
+  personal = { ...cfg }
+  applyTeamPolicy()
+}
+
+function applyTeamPolicy() {
+  Object.assign(cfg, mergePolicy(personal, teamPolicy))
+  cfg.namePrefix = normalizePrefix(cfg.namePrefix)
   rebuildOrgMap()
 }
 
+async function loadTeamPolicy($, root) {
+  const path = root + '/' + POLICY_FILE
+  teamPolicy = null
+  teamNote = ''
+  try {
+    if (await $.fs.exists(path)) teamPolicy = parsePolicy(await $.fs.read(path))
+  } catch (err) {
+    teamNote = POLICY_FILE + ' could not be read: ' + String(err?.message ?? err)
+  }
+  applyTeamPolicy()
+}
+
 function guardSettings() {
-  return { guardMode: cfg.guardMode, guardScripts: cfg.guardScripts, guardMcp: cfg.guardMcp, allowSecretCommands: cfg.allowSecretCommands }
+  const riskyPermissionFiles = [...files.values()]
+    .filter((f) => f.status !== 'deleted' && f.perms?.some((x) => x.risky && x.added))
+    .map((f) => ({ rel: projectRel(f.path), member: memberOf(projectRel(f.path)), grants: f.perms.filter((x) => x.risky && x.added).map((x) => x.text) }))
+  return { guardMode: cfg.guardMode, guardScripts: cfg.guardScripts, guardMcp: cfg.guardMcp, allowSecretCommands: cfg.allowSecretCommands, riskyPermissionFiles }
 }
 
 // ── Paths (forward slashes everywhere, so Windows paths match too) ──────────
@@ -546,6 +577,7 @@ async function loadProject($) {
       text = null
     }
   }
+  await loadTeamPolicy($, root)
   if (text === null) {
     project = { root: cwd, packageDirs: [], sourceApiVersion: null, found: false }
     return project
@@ -719,6 +751,7 @@ function recordChange(f, before, after) {
   f.tooLarge = big(after) || big(before) || big(f.original)
   f.lint = cfg.codeChecks && !f.binary && !f.tooLarge ? lintSource(f.path, after, { noComments: cfg.codingStandards }) : []
   f.soql = cfg.codeChecks && !f.binary && !f.tooLarge ? soqlFields(f.path, after) : []
+  f.perms = isPermissionFile(f.path) && after !== null ? permissionChanges(f.original ?? before ?? '', after) : []
   if (f.binary || f.tooLarge) {
     f.allDiff = ''
     f.latestDiff = ''
@@ -1212,7 +1245,8 @@ function fieldProblems(refs) {
 
 function codeProblems(f) {
   const file = f.path.split('/').pop()
-  return [...(f.lint ?? []), ...fieldProblems(f.soql)].map((p) => ({ file, line: p.line, problem: p.problem, rule: p.rule, source: p.rule === 'schema' ? 'schema' : 'lint' }))
+  const grants = (f.perms ?? []).filter((x) => x.risky && x.added).map((x) => ({ line: null, rule: 'permission', problem: 'Grants ' + x.text + ': a deploy of this file always asks first' }))
+  return [...(f.lint ?? []), ...fieldProblems(f.soql), ...grants].map((p) => ({ file, line: p.line, problem: p.problem, rule: p.rule, source: p.rule === 'schema' || p.rule === 'permission' ? p.rule : 'lint' }))
 }
 
 async function fetchDescribe($, org, object) {
@@ -1459,6 +1493,167 @@ async function validateChanged($) {
       $.ui.invalidate('ui.render')
     }
   })()
+}
+
+function stampNow() {
+  return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+}
+
+function safeName(text) {
+  return String(text ?? 'default').replace(/[^\w.@-]/g, '_')
+}
+
+async function inGitHistory($, rel, text) {
+  const hash = await $.process.run(['git', '-C', gitRoot, 'hash-object', '--stdin'], { stdin: text, timeoutMs: 10000 })
+  if (hash.exitCode !== 0) return true
+  const log = await $.process.run(['git', '-C', gitRoot, 'log', '--format=', '--raw', '--no-abbrev', '-n', '100', '--', rel], { timeoutMs: 20000 })
+  return log.exitCode !== 0 || log.stdout.includes(hash.stdout.trim())
+}
+
+async function orgChangesNotInGit($, retrieved) {
+  if (!gitRoot) return { checked: false, drift: [] }
+  const ls = await $.process.run(['git', '-C', gitRoot, 'ls-files'], { timeoutMs: 20000 })
+  if (ls.exitCode !== 0) return { checked: false, drift: [] }
+  const byTail = new Map()
+  for (const rel of ls.stdout.split('\n').filter(Boolean)) {
+    const tail = typeFolderTail(rel)
+    if (tail && !byTail.has(tail)) byTail.set(tail, rel)
+  }
+  const drift = []
+  let compared = 0
+  for (const path of retrieved.keys()) {
+    if (!/\.(cls|trigger|page|component|js|html|css|cmp)$/.test(path)) continue
+    const rel = byTail.get(typeFolderTail(path))
+    if (!rel || ++compared > 60) continue
+    const org = await $.fs.read(path)
+    const local = await $.fs.read(gitRoot + '/' + rel).catch(() => null)
+    if (local !== null && sameText(org, local)) continue
+    if (!(await inGitHistory($, rel, org))) drift.push(rel)
+  }
+  return { checked: true, drift }
+}
+
+async function backupFromOrg($, targets, checkDrift) {
+  if (!project) await loadProject($)
+  const root = project?.root || cwd
+  const made = []
+  const drift = []
+  for (const t of targets) {
+    const dir = root + '/.sfdx/sf-guardian/backups/' + stampNow() + '-' + safeName(t.org)
+    const r = await $.process.run(retrieveArgs(t.scope, project?.relDirs?.length ? project.relDirs : ['force-app'], dir, t.org), { cwd: root, timeoutMs: 600000 })
+    if (r.exitCode !== 0) return { ok: false, reason: String(parseJsonSafe(r.stdout)?.message ?? r.stderr ?? 'sf failed').split('\n')[0].slice(0, 300), made }
+    const retrieved = await listTree($, [dir])
+    const manifest = [...retrieved.keys()].filter((f) => f.endsWith('/package.xml')).sort((a, b) => a.length - b.length)[0]
+    made.push({ at: new Date().toISOString(), org: t.org ?? defaultOrg, dir: manifest ? manifest.slice(0, -'/package.xml'.length) : dir })
+    if (checkDrift) drift.push(...(await orgChangesNotInGit($, retrieved)).drift)
+  }
+  const stored = await storeGet($, 'backups')
+  const list = [...(Array.isArray(stored) ? stored : []), ...made].slice(-20)
+  backups.splice(0, backups.length, ...list)
+  await storeSet($, 'backups', list)
+  return { ok: true, made, drift }
+}
+
+function restoreCommand(b) {
+  return 'sf project deploy start --metadata-dir ' + quoteArg(b.dir) + ' -o ' + quoteArg(b.org ?? 'default') + ' --test-level RunLocalTests --dry-run'
+}
+
+async function backupOrStop($, cmd, deploys) {
+  running = 'Backing up what this deploy overwrites'
+  $.ui.invalidate('ui.render')
+  let b
+  try {
+    b = await backupFromOrg($, deploys.map((p) => ({ org: p.org, scope: deployScope(sfCommandOf(tokenize(p.segment)).words) })), true)
+  } catch (err) {
+    b = { ok: false, reason: String(err?.message ?? err), made: [] }
+  } finally {
+    running = null
+    $.ui.invalidate('ui.render')
+  }
+  const org = deploys[0].org
+  if (b.ok && b.drift.length === 0) {
+    $.ui.toast('Backup saved: ' + tildify(b.made[0].dir) + ' · /sfguard backups to restore')
+    return null
+  }
+  const question = b.ok
+    ? '⚠ ' + plural(b.drift.length, 'file') + ' in ' + org + ' were changed in the org and are not in git. This deploy overwrites them:\n' + b.drift.slice(0, 10).map((x) => '• ' + x).join('\n') + (b.drift.length > 10 ? '\n• …' : '') + '\nBackup saved: ' + tildify(b.made[0].dir)
+    : 'The backup before this deploy failed: ' + b.reason + '\nDeploy anyway, without a backup?'
+  const choices = b.ok ? ['Deploy anyway', 'Cancel'] : ['Deploy without backup', 'Cancel']
+  const answer = await askPerson($, question, choices)
+  await audit($, { command: cmd, org, cls: deploys[0].cls, verdict: 'ask', answer: answer ?? 'no answer', reason: b.ok ? 'org changes not in git: ' + b.drift.slice(0, 5).join(', ') : 'backup failed: ' + b.reason, outcome: answer === choices[0] ? 'continued' : 'cancelled' })
+  if (answer === choices[0]) return null
+  return { deny: b.ok ? 'The user cancelled: this deploy would overwrite changes made in ' + org + ' that are not in git (' + b.drift.slice(0, 5).join(', ') + '). Retrieve them into the project first.' : 'The user cancelled the deploy because the backup failed: ' + b.reason }
+}
+
+async function deletedMembers($) {
+  const out = new Map()
+  for (const f of files.values()) {
+    if (f.status !== 'deleted') continue
+    const m = memberOf(projectRel(f.path))
+    if (!m) continue
+    if (m.type === 'LightningComponentBundle' || m.type === 'AuraDefinitionBundle') {
+      const folder = f.path.slice(0, f.path.indexOf('/' + m.name + '/') + m.name.length + 1)
+      if (await $.fs.exists(folder).catch(() => true)) continue
+    }
+    out.set(m.type + ':' + m.name, m)
+  }
+  return [...out.values()]
+}
+
+async function deleteFromOrg($) {
+  const members = await deletedMembers($)
+  if (members.length === 0) {
+    $.ui.toast('No deleted metadata to remove from the org.')
+    return
+  }
+  const org = defaultOrg
+  if (!org) {
+    $.ui.toast('No default org. Run: sf config set target-org <alias>')
+    return
+  }
+  if (!project) await loadProject($)
+  const api = project?.sourceApiVersion ?? orgEntry(orgMap, org)?.org?.apiVersion
+  if (!api) {
+    $.ui.toast('Set sourceApiVersion in sfdx-project.json first.')
+    return
+  }
+  const cls = clsOf(org)
+  const root = project?.root || cwd
+  const dir = root + '/.sfdx/sf-guardian/destructive/' + stampNow()
+  const argv = ['sf', 'project', 'deploy', 'start', '--manifest', dir + '/package.xml', '--post-destructive-changes', dir + '/destructiveChanges.xml', '-o', org, '--wait', '9', '--json']
+  if (needsAsk(cls) && members.some((m) => m.type === 'ApexClass' || m.type === 'ApexTrigger')) argv.push('--test-level', 'RunLocalTests')
+  const list = members.map((m) => '• ' + m.type + ': ' + m.name).join('\n')
+  const blocked = cfg.guardMode === 'block' && needsAsk(cls)
+  const choices = blocked ? ['Validate first (dry run)', 'Cancel'] : ['Validate first (dry run)', 'Delete from org', 'Cancel']
+  const answer = await askPerson($, 'Delete these from ' + org + ' (' + cls + ')?\n' + list + '\n' + argv.map(quoteArg).join(' '), choices)
+  if (answer !== 'Validate first (dry run)' && answer !== 'Delete from org') return
+  const dry = answer !== 'Delete from org'
+  if (dry) argv.push('--dry-run')
+  await $.fs.write(dir + '/package.xml', manifestXml([], api))
+  await $.fs.write(dir + '/destructiveChanges.xml', manifestXml(members, api))
+  if (!dry && needsAsk(cls) && cfg.backupBeforeDeploy) {
+    const b = await backupFromOrg($, [{ org, scope: { sourceDirs: [], metadata: members.map((m) => m.type + ':' + m.name), manifest: null } }], false).catch((err) => ({ ok: false, reason: String(err?.message ?? err) }))
+    if (!b.ok) {
+      const go = await askPerson($, 'The backup before this delete failed: ' + b.reason + '\nDelete anyway, without a backup?', ['Delete without backup', 'Cancel'])
+      if (go !== 'Delete without backup') return
+    }
+  }
+  await audit($, { command: argv.join(' '), org, cls, verdict: 'ask', answer, reason: 'delete ' + plural(members.length, 'component') + ' from the org', outcome: 'started' })
+  running = (dry ? 'Validating the delete on ' : 'Deleting from ') + org
+  $.ui.invalidate('ui.render')
+  try {
+    const r = await $.process.run(argv, { cwd: root, timeoutMs: 600000 })
+    const d = summarizeDeploy(r.stdout || '')
+    const ok = r.exitCode === 0 && !!d && /^Succeeded$/i.test(d.status)
+    if (d) lastDeployProblems = d.failures
+    deployLog.push({ at: Date.now(), time: new Date().toLocaleTimeString(), org, kind: dry ? 'validate delete' : 'delete', ok })
+    $.ui.toast((ok ? '✔ ' : '✘ ') + (dry ? 'Delete validated on ' : 'Deleted from ') + org + (ok ? '' : ': ' + (d?.failures[0]?.problem ?? String(parseJsonSafe(r.stdout)?.message ?? r.stderr ?? 'failed').split('\n')[0])))
+  } catch (err) {
+    $.ui.toast('✘ Could not run the delete: ' + String(err?.message ?? err))
+  } finally {
+    running = null
+    $.ui.invalidate('ui.render')
+  }
 }
 
 async function newComponentProblem($, tool, file) {
@@ -1783,6 +1978,9 @@ function renderFilesPane($, e) {
       ...(sel && sel.status !== 'deleted'
         ? [Button({ key: 'files-open', label: 'Open', hotkey: 'o', plain: true, dimColor: true, onPress: () => openInEditor($, sel.path, problemsFor(sel.path)[0]?.line ?? sel.focus?.[0] ?? null) })]
         : []),
+      ...(list.some((f) => f.status === 'deleted' && memberOf(projectRel(f.path)))
+        ? [Button({ key: 'files-delete-org', label: 'Delete from org', hotkey: 'd', plain: true, dimColor: true, onPress: () => deleteFromOrg($) })]
+        : []),
       ...(problems.length ? [Button({ key: 'files-fix', label: 'Ask Claude to fix', hotkey: 'a', plain: true, color: 'red', onPress: () => askClaudeToFix($) })] : []),
       Text({ dimColor: true, children: ['esc: close'] }),
     ],
@@ -1928,6 +2126,11 @@ function renderFilesPane($, e) {
         detail.push(note('lines ' + first + '–' + last + ' of ' + lines.length))
         detail.push(code(lines.slice(first - 1, last).join('\n'), { startLine: first }))
       }
+    }
+    if (sel.perms?.length && sel.status !== 'deleted') {
+      detail.push(note('Permission changes since the session started:'))
+      for (const x of sel.perms.slice(0, 12)) detail.push(Text({ ...(x.risky ? { color: 'red', bold: true } : x.added ? {} : { dimColor: true }), wrap: 'wrap', children: [(x.added ? '+ grants ' : '− removes ') + x.text + (x.risky ? '  (risky)' : '')] }))
+      if (sel.perms.length > 12) detail.push(note('and ' + (sel.perms.length - 12) + ' more'))
     }
     // Problems in this file, under the view
     const probs = problemsFor(sel.path)
@@ -2131,6 +2334,12 @@ async function sfguardCommand($, args) {
     }
     return explain(await judge($, cmd))
   }
+  if (a === 'backups') {
+    const stored = await storeGet($, 'backups')
+    const list = Array.isArray(stored) ? stored : backups
+    if (list.length === 0) return 'No backups yet. SF Guardian saves one before each deploy to a production or unknown org.'
+    return 'Backups taken before production deploys, newest first. Validate a restore with its command, then run it without --dry-run:\n' + [...list].reverse().map((b) => '• ' + new Date(b.at).toLocaleString() + ' · ' + b.org + '\n  ' + tildify(b.dir) + '\n  ' + restoreCommand(b)).join('\n') + '\nA restore puts back what the org had; it does not remove components the deploy added.'
+  }
   if (a === 'orgs') {
     await orgsForGuard($)
     return orgsReport()
@@ -2147,8 +2356,8 @@ async function sfguardCommand($, args) {
   }
   const stored = cfg.auditLog ? await auditEntries($) : decisions
   const recent = stored.slice(-20)
-  if (recent.length === 0) return 'No guarded commands yet.' + '\nTry: /sfguard test sf project deploy start -o prod --test-level RunLocalTests\n     /sfguard orgs · /sfguard export [file]'
-  return 'Last ' + recent.length + ' guard decisions (mode: ' + cfg.guardMode + (cfg.auditLog ? ', audit log on' : ', audit log off') + '):\n' + recent.map(decisionLine).join('\n') + '\n\n/sfguard test <command> · /sfguard orgs · /sfguard export [file]'
+  if (recent.length === 0) return 'No guarded commands yet.' + '\nTry: /sfguard test sf project deploy start -o prod --test-level RunLocalTests\n     /sfguard orgs · /sfguard backups · /sfguard export [file]'
+  return 'Last ' + recent.length + ' guard decisions (mode: ' + cfg.guardMode + (cfg.auditLog ? ', audit log on' : ', audit log off') + '):\n' + recent.map(decisionLine).join('\n') + '\n\n/sfguard test <command> · /sfguard orgs · /sfguard backups · /sfguard export [file]'
 }
 
 async function runQuiet($, argv, timeoutMs = 8000) {
@@ -2258,6 +2467,10 @@ async function sfdoctor($, args) {
   // Unparsed outputs
   if (unparsed.count === 0) ok('No unparsed sf output this session')
   else warn(plural(unparsed.count, 'sf output') + ' could not be summarized this session', '/sfdoctor record saves the last one (cleaned) for a bug report')
+  if (teamNote) bad(teamNote, 'Fix the JSON in ' + POLICY_FILE)
+  else if (teamPolicy) ok('Team policy (' + POLICY_FILE + '): ' + policySummary(teamPolicy))
+  else ok('No team policy file (' + POLICY_FILE + '); your own settings apply')
+  ok('Backups before production deploys ' + (cfg.backupBeforeDeploy ? 'on' : 'off'))
   if (cfg.codingStandards) ok('Coding standards on' + (cfg.namePrefix ? ' · new components need the ' + cfg.namePrefix + '_ prefix' : ' · no name prefix set'))
   else warn('Coding standards off', 'Turn them on in /config')
   // Live typing
@@ -2308,7 +2521,7 @@ export function register(on, options) {
       { name: 'sforg', description: 'Show and refresh the default Salesforce org' },
       { name: 'deploys', description: 'List the deploys Claude ran in this session' },
       { name: 'sflimits', description: 'Show org API limits: /sflimits [alias]' },
-      { name: 'sfguard', description: 'Guard decisions; /sfguard test <command>, /sfguard orgs, /sfguard export [file]' },
+      { name: 'sfguard', description: 'Guard decisions; /sfguard test <command>, orgs, backups, export [file]' },
       { name: 'sfdoctor', description: 'Check the SF Guardian setup; /sfdoctor record, /sfdoctor perf' },
     ]) {
       try {
@@ -2433,6 +2646,11 @@ export function register(on, options) {
         return { deny: 'The user declined this command against ' + label + '. Ask the user before trying another approach.' }
       }
       if (answer.startsWith('Validate')) command = applyDryRun(cmd, result.parts)
+      const deploys = answer === 'Run as written' ? result.parts.filter((p) => p.verdict === 'ask' && p.category === 'deploy' && needsAsk(p.cls) && !p.inner) : []
+      if (cfg.backupBeforeDeploy && deploys.length) {
+        const stop = await backupOrStop($, cmd, deploys)
+        if (stop) return stop
+      }
     }
 
     const info = describeSf(command)

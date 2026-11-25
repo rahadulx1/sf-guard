@@ -1,7 +1,7 @@
 {
   "name": "sf-guardian",
   "displayName": "SF Guardian",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Salesforce helper for Claude Code: production guard that detects your orgs, coding standards and naming prefix, live code checks (SOQL/DML in loops, unknown fields), org schema and SOQL tools for Claude, live Files sidebar, deploy and test failures with file and line, coverage, audit log, /sfdoctor",
   "author": {
     "name": "Rahadul"
@@ -40,6 +40,12 @@
       "type": "boolean",
       "title": "Guard Salesforce MCP tools",
       "description": "deploy_metadata, assign_permission_set, delete_org and resume_tool_operation ask first on production or unknown orgs.",
+      "default": true
+    },
+    "backup_before_deploy": {
+      "type": "boolean",
+      "title": "Back up before production deploys",
+      "description": "Before a deploy to a production or unknown org runs, retrieve what it will overwrite into .sfdx/sf-guardian/backups, and warn when the org holds changes that are not in git. /sfguard backups lists restore commands.",
       "default": true
     },
     "allow_secret_commands": {

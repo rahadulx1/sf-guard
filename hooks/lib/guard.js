@@ -8,6 +8,7 @@
 
 import { allSimpleCommands, commandWords, flagValue, hasFlag, programName, tokenize } from './shell.js'
 import { needsAsk, orgClass } from './orgs.js'
+import { deployScope, scopeCovers } from './metadata.js'
 
 // What counts as a change to an org (section 6.2). Longest match wins.
 const SF_TABLE = [
@@ -170,6 +171,13 @@ export function scriptRefOf(words) {
   return null
 }
 
+function riskyGrantsIn(sf, settings) {
+  const files = settings.riskyPermissionFiles ?? []
+  if (!files.length) return []
+  const scope = deployScope(sf.words)
+  return files.filter((f) => scopeCovers(scope, f.rel, f.member)).flatMap((f) => f.grants.map((g) => g + ' (' + f.rel.split('/').pop() + ')'))
+}
+
 function judgeSf(sf, segment, ctx) {
   const { orgMap, defaultOrg, settings } = ctx
   const cat = sf.category
@@ -192,6 +200,9 @@ function judgeSf(sf, segment, ctx) {
     if (block && risky) return { ...part, verdict: 'refuse', reason: 'guard mode is block: no lifecycle changes to ' + who }
     return { ...part, verdict: 'ask', reason: 'org lifecycle commands always ask' }
   }
+  const grants = cat === 'deploy' ? riskyGrantsIn(sf, settings) : []
+  const grantNote = grants.length ? '; it grants ' + grants.join(', ') : ''
+  if (!risky && grants.length) return { ...part, verdict: 'ask', reason: 'deploy to ' + who + grantNote, grants }
   if (!risky) return { ...part, reason: who + ' is not production' }
   if (cat === 'deploy' && !namesTests(sf.words)) {
     return { ...part, verdict: 'refuse', reason: 'Production deploys must name a test level. Re-run with --test-level RunLocalTests, or --test-level RunSpecifiedTests --tests <TestClass>.' }
@@ -200,7 +211,7 @@ function judgeSf(sf, segment, ctx) {
     const tip = cat === 'deploy' ? ' Validate instead with --dry-run.' : ''
     return { ...part, verdict: 'refuse', reason: 'guard mode is block: no changes to ' + who + '.' + tip }
   }
-  const p = { ...part, verdict: 'ask', reason: CATEGORY_LABEL[cat] + ' on ' + who }
+  const p = { ...part, verdict: 'ask', reason: CATEGORY_LABEL[cat] + ' on ' + who + grantNote, grants }
   if (cat === 'deploy') p.rewrite = '--dry-run'
   return p
 }
@@ -315,6 +326,6 @@ export function choicesFor(result, isMcp = false) {
 export function questionFor(result) {
   const risky = result.parts.filter((p) => p.verdict === 'ask')
   const orgs = [...new Set(risky.map((p) => (p.org ?? 'default org') + (p.cls === 'production' ? ' · PRODUCTION' : ' · ' + p.cls.toUpperCase())))]
-  const lines = risky.map((p) => '• ' + (CATEGORY_LABEL[p.category] ?? p.category) + ': ' + (p.inner ? p.inner + '  (inside ' + p.via + ')' : p.segment))
+  const lines = risky.map((p) => '• ' + (CATEGORY_LABEL[p.category] ?? p.category) + ': ' + (p.inner ? p.inner + '  (inside ' + p.via + ')' : p.segment) + (p.grants?.length ? '\n  ⚠ grants ' + p.grants.join(', ') : ''))
   return '⚠️ ' + orgs.join(', ') + '\n' + lines.join('\n') + '\nRun this?'
 }

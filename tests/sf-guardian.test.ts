@@ -1315,3 +1315,179 @@ describe('0.10: coding standards, code checks, org tools', () => {
     expect(sent).toMatch(/--class-names AccountServiceTest --code-coverage --json --wait 10/)
   })
 })
+
+describe('0.11: safer deploys', () => {
+  const SFDX = { '/project/sfdx-project.json': JSON.stringify({ packageDirectories: [{ path: 'force-app' }], sourceApiVersion: '62.0' }) }
+  const CLS = '/project/force-app/main/default/classes/'
+
+  function retrieveStub(disk: Record<string, string>, orgCopy: string, calls: string[][], fail = false) {
+    return (line: string, e: any) => {
+      if (!line.startsWith('sf project retrieve start')) return undefined
+      calls.push(e.argv)
+      if (fail) return { value: { exitCode: 1, stdout: JSON.stringify({ status: 1, message: 'INVALID_LOGIN' }), stderr: '' } }
+      const dir = e.argv[e.argv.indexOf('--target-metadata-dir') + 1]
+      disk[dir + '/unpackaged/package.xml'] = '<Package/>'
+      disk[dir + '/unpackaged/classes/AccountService.cls'] = orgCopy
+      return { value: { exitCode: 0, stdout: JSON.stringify({ status: 0, result: { files: [] } }), stderr: '' } }
+    }
+  }
+
+  test('a production deploy is backed up first; the backup is listed with its restore command', async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX, [CLS + 'AccountService.cls']: 'class A {}\n' }
+    const calls: string[][] = []
+    const p = project(on, disk, { orgList: ORG_LIST.result, run: retrieveStub(disk, 'class A {}\n', calls) })
+    store(on)
+    const seen = bash(on, 'Run as written')
+    await start($)
+    await $.tool.call({ tool: 'Bash', command: 'sf project deploy start -o prod -d force-app/main/default/classes -l RunLocalTests' })
+    expect(calls[0]).toEqual(['sf', 'project', 'retrieve', 'start', '--target-metadata-dir', calls[0][5], '--unzip', '--wait', '9', '--json', '-o', 'prod', '--source-dir', 'force-app/main/default/classes'])
+    expect(calls[0][5]).toMatch(/^\/project\/\.sfdx\/sf-guardian\/backups\/\d{4}-\d\d-\d\dT[\d-]+-prod$/)
+    expect(seen.ran).toEqual(['sf project deploy start -o prod -d force-app/main/default/classes -l RunLocalTests'])
+    expect(p.state.toasts.some((t: string) => /Backup saved/.test(t))).toBe(true)
+    const r: any = await $.command.run({ command: 'sfguard', args: 'backups' } as any)
+    expect(r.text).toMatch(/sf project deploy start --metadata-dir \/project\/\.sfdx\/sf-guardian\/backups\/.+-prod\/unpackaged -o prod --test-level RunLocalTests --dry-run/)
+  })
+
+  test('changes in the org that are not in git stop the deploy unless you say so', async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX, [CLS + 'AccountService.cls']: 'class A { mine }\n' }
+    const calls: string[][] = []
+    const stub = retrieveStub(disk, 'class A { hotfix in org }\n', calls)
+    project(on, disk, {
+      orgList: ORG_LIST.result,
+      git: '/project',
+      run: (line, e) => {
+        if (line.includes(' ls-files')) return { value: { exitCode: 0, stdout: 'force-app/main/default/classes/AccountService.cls\n', stderr: '' } }
+        if (line.includes(' hash-object')) return { value: { exitCode: 0, stdout: 'aaaa1111\n', stderr: '' } }
+        if (line.includes(' log --format=')) return { value: { exitCode: 0, stdout: ':100644 100644 bbbb2222 cccc3333 M\tforce-app/main/default/classes/AccountService.cls\n', stderr: '' } }
+        return stub(line, e)
+      },
+    })
+    store(on)
+    const asked: string[] = []
+    const ran: string[] = []
+    on('tool.call', ($$: any, e: any) => {
+      if (e.tool === 'AskUserQuestion') {
+        const q = e.questions?.[0]?.question ?? ''
+        asked.push(q)
+        return answerAsk(e, /not in git/.test(q) ? 'Cancel' : 'Run as written')
+      }
+      ran.push(e.command)
+      return { result: { stdout: '', stderr: '' } }
+    })
+    await start($)
+    const r: any = await $.tool.call({ tool: 'Bash', command: 'sf project deploy start -o prod -l RunLocalTests' })
+    expect(asked[1]).toMatch(/1 file in prod were changed in the org and are not in git[\s\S]*force-app\/main\/default\/classes\/AccountService\.cls/)
+    expect(String(r.deny ?? r.text)).toMatch(/not in git/)
+    expect(ran).toEqual([])
+  })
+
+  test('a failed backup asks before deploying without one', async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX }
+    project(on, disk, { orgList: ORG_LIST.result, run: retrieveStub(disk, '', [], true) })
+    store(on)
+    const asked: string[] = []
+    on('tool.call', ($$: any, e: any) => {
+      if (e.tool === 'AskUserQuestion') {
+        asked.push(e.questions?.[0]?.question ?? '')
+        return answerAsk(e, asked.length === 1 ? 'Run as written' : 'Deploy without backup')
+      }
+      return { result: { stdout: '', stderr: '' } }
+    })
+    await start($)
+    const r: any = await $.tool.call({ tool: 'Bash', command: 'sf project deploy start -o prod -l RunLocalTests' })
+    expect(asked[1]).toMatch(/backup before this deploy failed: INVALID_LOGIN/)
+    expect(r.deny).toBeUndefined()
+  })
+
+  test('no backup for a sandbox, a validation, or when turned off', { options: { backup_before_deploy: false } }, async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX }
+    const calls: string[][] = []
+    project(on, disk, { orgList: ORG_LIST.result, run: retrieveStub(disk, '', calls) })
+    store(on)
+    bash(on, 'Run as written')
+    await start($)
+    await $.tool.call({ tool: 'Bash', command: 'sf project deploy start -o prod -l RunLocalTests' })
+    await $.tool.call({ tool: 'Bash', command: 'sf project deploy start -o uat' })
+    expect(calls.length).toBe(0)
+  })
+
+  test('a team policy file adds production orgs and turns on block mode', async ($, on) => {
+    project(on, { ...SFDX, '/project/.sfguard.json': JSON.stringify({ prod_orgs: ['uat'], guard_mode: 'block', name_prefix: 'INV' }) }, { orgList: ORG_LIST.result })
+    store(on)
+    const seen = bash(on, 'Run as written')
+    await start($)
+    const r: any = await $.tool.call({ tool: 'Bash', command: 'sf data delete record -s A -i 1 -o uat' })
+    expect(String(r.deny ?? r.text)).toMatch(/block/)
+    const w: any = await $.tool.call({ tool: 'Write', file_path: CLS + 'LeadService.cls', content: 'x' } as any)
+    expect(String(w.deny ?? w.text)).toMatch(/INV_LeadService/)
+    const d: any = await $.command.run({ command: 'sfdoctor', args: '' } as any)
+    expect(d.text).toMatch(/Team policy \(\.sfguard\.json\): production orgs uat · guard mode block · name prefix INV/)
+    expect(seen.ran.length).toBe(0)
+  })
+
+  test('a broken team policy file is reported, and your settings apply', async ($, on) => {
+    project(on, { ...SFDX, '/project/.sfguard.json': '{oops' }, { orgList: ORG_LIST.result })
+    store(on)
+    await start($)
+    const d: any = await $.command.run({ command: 'sfdoctor', args: '' } as any)
+    expect(d.text).toMatch(/✘ \.sfguard\.json could not be read/)
+  })
+
+  test('a deploy that grants risky permissions asks even on a sandbox', async ($, on) => {
+    const path = '/project/force-app/main/default/permissionsets/Sales.permissionset-meta.xml'
+    const disk: Record<string, string> = { ...SFDX, [path]: '<PermissionSet></PermissionSet>' }
+    project(on, disk, { orgList: ORG_LIST.result })
+    store(on)
+    const asked: string[] = []
+    on('tool.call', ($$: any, e: any) => {
+      if (e.tool === 'AskUserQuestion') {
+        asked.push(e.questions?.[0]?.question ?? '')
+        return answerAsk(e, 'Cancel')
+      }
+      if (e.file_path) disk[e.file_path] = '<PermissionSet><userPermissions><enabled>true</enabled><name>ModifyAllData</name></userPermissions></PermissionSet>'
+      return { result: 'ok' }
+    })
+    await start($)
+    await $.tool.call({ tool: 'Edit', file_path: path, old_string: 'x', new_string: 'y' } as any)
+    const ui = await filesPane($)
+    expect(await ui.find({ type: 'Text', text: /\+ grants ModifyAllData  \(risky\)/ })).toBeDefined()
+    await ui.unmount()
+    await $.tool.call({ tool: 'Bash', command: 'sf project deploy start -o uat -d force-app/main/default/permissionsets' })
+    expect(asked[0]).toMatch(/grants ModifyAllData \(Sales\.permissionset-meta\.xml\)/)
+    await $.tool.call({ tool: 'Bash', command: 'sf project deploy start -o uat -d force-app/main/default/classes' })
+    expect(asked.length).toBe(1)
+  })
+
+  test('d deletes removed components from the org through a destructive manifest', async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX, [CLS + 'OldService.cls']: 'class OldService {}\n' }
+    let deployed: string[] = []
+    project(on, disk, {
+      orgList: ORG_LIST.result,
+      run: (line, e) => {
+        if (!line.startsWith('sf project deploy start')) return undefined
+        deployed = e.argv
+        return { value: { exitCode: 0, stdout: JSON.stringify({ status: 0, result: { status: 'Succeeded' } }), stderr: '' } }
+      },
+    })
+    store(on)
+    const asked: string[] = []
+    on('tool.call', ($$: any, e: any) => {
+      if (e.tool === 'AskUserQuestion') {
+        asked.push(e.questions?.[0]?.question ?? '')
+        return answerAsk(e, 'Validate first (dry run)')
+      }
+      delete disk[CLS + 'OldService.cls']
+      return { result: { stdout: '', stderr: '' } }
+    })
+    await start($)
+    await $.tool.call({ tool: 'Bash', command: 'rm force-app/main/default/classes/OldService.cls' })
+    const ui = await filesPane($)
+    await ui.press({ key: 'files-delete-org' })
+    expect(asked[0]).toMatch(/Delete these from uat \(sandbox\)\?\n• ApexClass: OldService/)
+    const dir = deployed[deployed.indexOf('--manifest') + 1].replace(/\/package\.xml$/, '')
+    expect(disk[dir + '/destructiveChanges.xml']).toMatch(/<members>OldService<\/members>\s*<name>ApexClass<\/name>/)
+    expect(disk[dir + '/package.xml']).not.toMatch(/<types>/)
+    expect(deployed).toContain('--dry-run')
+    expect(deployed).toContain('--post-destructive-changes')
+  })
+})

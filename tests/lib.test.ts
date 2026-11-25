@@ -444,3 +444,78 @@ describe('component names', () => {
     expect(standardsText('ACME')).toMatch(/ACME_ContractRequestService/)
   })
 })
+
+import { mergePolicy, parsePolicy } from '../hooks/lib/policy.js'
+import { parsePermissions, permissionChanges } from '../hooks/lib/permissions.js'
+import { deployScope as scopeOf, manifestXml, memberOf, retrieveArgs, sameText, scopeCovers, typeFolderTail } from '../hooks/lib/metadata.js'
+
+describe('team policy (tighten only)', () => {
+  const me = { prodOrgs: ['prod'], safeOrgs: ['dev'], guardMode: 'ask', guardScripts: false, guardMcp: false, allowSecretCommands: true, codingStandards: false, codeChecks: false, backupBeforeDeploy: false, auditLog: false, namePrefix: '' }
+  test('adds production orgs, turns protections on, sets the prefix', async () => {
+    const out = mergePolicy(me, { prod_orgs: ['Release@acme.com'], guard_mode: 'block', allow_secret_commands: false, coding_standards: true, code_checks: true, backup_before_deploy: true, audit_log: true, guard_scripts: true, guard_mcp: true, name_prefix: 'INV' })
+    expect(out).toEqual({ prodOrgs: ['prod', 'release@acme.com'], safeOrgs: ['dev'], guardMode: 'block', guardScripts: true, guardMcp: true, allowSecretCommands: false, codingStandards: true, codeChecks: true, backupBeforeDeploy: true, auditLog: true, namePrefix: 'INV' })
+  })
+  test('cannot loosen anything', async () => {
+    const strict = { ...me, guardMode: 'block', allowSecretCommands: false, codingStandards: true, backupBeforeDeploy: true }
+    expect(mergePolicy(strict, { guard_mode: 'ask', allow_secret_commands: true, coding_standards: false, backup_before_deploy: false, safe_orgs: ['prod'] })).toEqual(strict)
+  })
+  test('a policy file must be a JSON object', async () => {
+    expect(() => parsePolicy('[1]')).toThrow()
+    expect(() => parsePolicy('{oops')).toThrow()
+    expect(parsePolicy('{"guard_mode":"block"}').guard_mode).toBe('block')
+  })
+})
+
+describe('permission changes', () => {
+  const before = '<PermissionSet><objectPermissions><allowRead>true</allowRead><object>Account</object></objectPermissions><userPermissions><enabled>true</enabled><name>ApiEnabled</name></userPermissions></PermissionSet>'
+  const after = '<PermissionSet><objectPermissions><allowEdit>true</allowEdit><allowRead>true</allowRead><modifyAllRecords>true</modifyAllRecords><object>Account</object></objectPermissions><fieldPermissions><editable>true</editable><field>Account.Revenue__c</field><readable>true</readable></fieldPermissions><userPermissions><enabled>true</enabled><name>ModifyAllData</name></userPermissions><userPermissions><enabled>false</enabled><name>ViewSetup</name></userPermissions></PermissionSet>'
+  test('grants and removals, with risky ones marked', async () => {
+    const changes = permissionChanges(before, after).map((c: any) => (c.added ? '+' : '-') + c.text + (c.risky ? '!' : ''))
+    expect(changes.sort()).toEqual(['+Edit on Account', '+Edit on field Account.Revenue__c', '+Modify All on Account!', '+ModifyAllData!', '+Read on field Account.Revenue__c', '-ApiEnabled'].sort())
+  })
+  test('disabled permissions are not grants', async () => {
+    expect(parsePermissions(after).has('user:ViewSetup')).toBe(false)
+  })
+})
+
+describe('metadata names and deploy scope', () => {
+  const cases: [string, any][] = [
+    ['force-app/main/default/classes/A.cls', { type: 'ApexClass', name: 'A' }],
+    ['force-app/main/default/classes/A.cls-meta.xml', { type: 'ApexClass', name: 'A' }],
+    ['force-app/main/default/triggers/T.trigger', { type: 'ApexTrigger', name: 'T' }],
+    ['force-app/main/default/lwc/inv_card/inv_card.js', { type: 'LightningComponentBundle', name: 'inv_card' }],
+    ['force-app/main/default/objects/Invoice__c/fields/Total__c.field-meta.xml', { type: 'CustomField', name: 'Invoice__c.Total__c' }],
+    ['force-app/main/default/objects/Invoice__c/Invoice__c.object-meta.xml', { type: 'CustomObject', name: 'Invoice__c' }],
+    ['force-app/main/default/permissionsets/Sales.permissionset-meta.xml', { type: 'PermissionSet', name: 'Sales' }],
+    ['README.md', null],
+  ]
+  for (const [path, want] of cases) test(path, async () => expect(memberOf(path)).toEqual(want))
+
+  test('manifest xml', async () => {
+    expect(manifestXml([{ type: 'ApexClass', name: 'B' }, { type: 'ApexClass', name: 'A' }], '62.0')).toBe(
+      '<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n    <types>\n        <members>A</members>\n        <members>B</members>\n        <name>ApexClass</name>\n    </types>\n    <version>62.0</version>\n</Package>\n',
+    )
+    expect(manifestXml([], '62.0')).not.toMatch(/<types>/)
+  })
+
+  test('scope from deploy flags, and what it covers', async () => {
+    const scope = scopeOf(['sf', 'project', 'deploy', 'start', '-d', 'force-app/main/default/classes', 'force-app/main/default/lwc', '--metadata=PermissionSet:Sales', '-o', 'prod'])
+    expect(scope).toEqual({ sourceDirs: ['force-app/main/default/classes', 'force-app/main/default/lwc'], metadata: ['PermissionSet:Sales'], manifest: null })
+    expect(scopeCovers(scope, 'force-app/main/default/classes/A.cls', null)).toBe(true)
+    expect(scopeCovers(scope, 'force-app/main/default/permissionsets/Sales.permissionset-meta.xml', { type: 'PermissionSet', name: 'Sales' })).toBe(true)
+    expect(scopeCovers(scope, 'force-app/main/default/permissionsets/Other.permissionset-meta.xml', { type: 'PermissionSet', name: 'Other' })).toBe(false)
+    expect(scopeCovers(scopeOf(['sf', 'project', 'deploy', 'start']), 'anything', null)).toBe(true)
+  })
+
+  test('backup retrieve mirrors the deploy scope', async () => {
+    expect(retrieveArgs({ sourceDirs: [], metadata: [], manifest: null }, ['force-app'], '/b', 'prod')).toEqual(['sf', 'project', 'retrieve', 'start', '--target-metadata-dir', '/b', '--unzip', '--wait', '9', '--json', '-o', 'prod', '--source-dir', 'force-app'])
+    expect(retrieveArgs({ sourceDirs: [], metadata: ['ApexClass:A'], manifest: null }, ['force-app'], '/b', 'prod').slice(-2)).toEqual(['--metadata', 'ApexClass:A'])
+    expect(retrieveArgs({ sourceDirs: ['x'], metadata: [], manifest: 'p.xml' }, ['force-app'], '/b', 'prod').slice(-2)).toEqual(['--manifest', 'p.xml'])
+  })
+
+  test('paths match across formats; text compares without line-ending noise', async () => {
+    expect(typeFolderTail('/b/unpackaged/classes/A.cls')).toBe('classes/A.cls')
+    expect(typeFolderTail('force-app/main/default/classes/A.cls')).toBe('classes/A.cls')
+    expect(sameText('a\r\nb  \n', 'a\nb')).toBe(true)
+  })
+})

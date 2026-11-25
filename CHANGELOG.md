@@ -2,6 +2,15 @@
 
 All notable changes to SF Guardian. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/) (patch for fixes, minor for features). Settings keys are never repurposed.
 
+## [0.11.0] - 2026-11-25
+
+### Added
+- Backup before production deploys (`backup_before_deploy`, on): when you choose "Run as written" for a deploy to a production or unknown org, SF Guardian first retrieves what it will overwrite (same scope as the deploy) into `.sfdx/sf-guardian/backups/<time>-<org>`, in metadata format. `/sfguard backups` lists each backup with its restore command. A failed backup asks before deploying without one.
+- Org changes not in git: after the backup, each retrieved Apex, Visualforce, LWC and Aura file is compared with your files and their git history. Files changed in the org that git never had (a hotfix made in the org) are listed and the deploy asks again before overwriting them.
+- Permission checks: changed profiles and permission sets show their changes in plain words in the Files sidebar ("+ grants Modify All on Account"). Risky grants (Modify All Data, View All Data, Manage Users, Author Apex, Modify/View All records and others) are problems, and a deploy that includes them asks even on a sandbox.
+- Team policy file `.sfguard.json` in the project root, shared through git. It can only tighten your settings: add production orgs, turn on block mode, backups, code checks, coding standards, script and MCP guards, the audit log, forbid secret commands, and set the name prefix. `/sfdoctor` shows it.
+- `d` in the Files sidebar deletes components you removed locally from the default org, through `destructiveChanges.xml` and an empty `package.xml`, after a confirmation, with a dry-run option and a backup on production.
+
 ## [0.10.0] - 2026-11-25
 
 ### Added

@@ -42,7 +42,7 @@ claude plugin marketplace update sf-guard
 claude plugin update sf-guardian@sf-guard
 ```
 
-Restart Claude Code afterwards. Your settings are kept. The version you are running shows at the end of the band above the prompt (`SF Guardian v0.10.0`) and on the first line of `/sfdoctor`.
+Restart Claude Code afterwards. Your settings are kept. The version you are running shows at the end of the band above the prompt (`SF Guardian v0.11.0`) and on the first line of `/sfdoctor`.
 
 To update automatically, open `/plugin`, choose **Marketplaces**, select `sf-guard`, and choose **Enable auto-update**.
 
@@ -160,23 +160,74 @@ Problems show under the draft or the file in the Files sidebar, mark the file wi
 
 Both use your default org unless Claude names another.
 
-### 6. `/sfguard`: see and test the guard's decisions
+### 6. Backup before production deploys, and changes made in the org
+
+**What it is for:** a way back if a production deploy goes wrong, and a warning before you overwrite a colleague's hotfix made directly in the org.
+
+When you choose **Run as written** for a deploy to a production or unknown org:
+
+1. SF Guardian retrieves what the deploy will overwrite, using the same scope as the deploy (`-d`, `-m` or `-x`; otherwise your package directories). The backup goes into `.sfdx/sf-guardian/backups/<time>-<org>/`, in metadata format. The `.sfdx` folder is git-ignored in Salesforce projects.
+2. It compares each retrieved Apex class, trigger, Visualforce, LWC and Aura file with your file and its git history. If the org holds a version that git has never seen, someone changed it in the org. You get a second question listing those files: **Deploy anyway** or **Cancel**.
+3. If the backup fails, you're asked whether to deploy without one.
+
+`/sfguard backups` lists every backup with its restore command, for example:
+
+    sf project deploy start --metadata-dir .sfdx/sf-guardian/backups/2026-11-25T10-02-11-prod/unpackaged -o prod --test-level RunLocalTests --dry-run
+
+Run it as shown to validate the restore, then again without `--dry-run`. A restore puts back what the org had; it does not remove components the deploy added. Turn backups off with **Back up before production deploys**.
+
+### 7. Permission checks
+
+**What it is for:** permission XML diffs are hard to read, and an accidental "Modify All Data" is one of the most dangerous changes you can deploy.
+
+- When a profile or permission set changes, the Files sidebar lists the changes in plain words: `+ grants Edit on field Account.Revenue__c`, `+ grants Modify All on Account  (risky)`, `− removes ApiEnabled`.
+- Risky grants are marked as problems: Modify All Data, View All Data, Modify Metadata, Manage Users, Manage Profiles and Permission Sets, Assign Permission Sets, Manage Roles, Manage Sharing, Reset Passwords, Author Apex, Customize Application, View All Users, and View All or Modify All on an object.
+- A deploy whose scope includes a file with a risky grant **asks even on a sandbox**, and the question names the grant.
+
+### 8. Team policy file (`.sfguard.json`)
+
+**What it is for:** giving the whole team the same guard without everyone configuring it.
+
+Put `.sfguard.json` in the project root and commit it:
+
+```json
+{
+  "prod_orgs": ["prod", "release@acme.com"],
+  "guard_mode": "block",
+  "name_prefix": "INV",
+  "backup_before_deploy": true,
+  "code_checks": true,
+  "coding_standards": true,
+  "allow_secret_commands": false
+}
+```
+
+The file can only **tighten** each person's settings. It adds production orgs, turns protections on (`guard_mode: "block"`, `guard_scripts`, `guard_mcp`, `backup_before_deploy`, `code_checks`, `coding_standards`, `audit_log`), forbids secret commands, and sets the name prefix. It cannot turn a protection off or mark an org as safe. `/sfdoctor` shows what the file changes, and reports it if the JSON is broken.
+
+### 9. Delete removed components from the org (`d`)
+
+**What it is for:** when Claude deletes a class or component locally, the org still has it. Removing it properly needs a destructive manifest, which is easy to get wrong by hand.
+
+Press `d` in the Files sidebar. SF Guardian collects the deleted metadata (Apex classes, triggers, pages, LWC and Aura bundles deleted whole, custom objects and fields, permission sets, flows, layouts and more). It writes `destructiveChanges.xml` and an empty `package.xml` to `.sfdx/sf-guardian/destructive/<time>/` and shows the exact command for your default org. Choose **Validate first (dry run)** or **Delete from org**. On production, Apex deletes run `RunLocalTests` and a backup is taken first. In block mode only the dry run is offered.
+
+### 10. `/sfguard`: see and test the guard's decisions
 
 **What it is for:** trusting the guard, and finding out why it asked (or did not).
 
 - `/sfguard`: the last 20 decisions: time, verdict, your answer, the outcome, the org and its class, and the command.
 - `/sfguard test <command>`: shows what the guard would do and why, **without running anything**. Example: `/sfguard test sf project deploy start -o prod --test-level RunLocalTests`.
 - `/sfguard orgs`: every org with alias, username and class, and whether the class came from sf or from your settings. It also marks your default org and shows scratch org expiry.
+- `/sfguard backups`: the backups taken before production deploys, each with its restore command.
 - `/sfguard export [file]`: writes the audit log to a JSON file (default `sf-guardian-audit-<date>.json`).
 
 **Audit log** (setting **Audit log**): every guarded command is recorded locally: the last 500, with passwords, client secrets, session ids and auth URLs removed. Nothing is sent anywhere.
 
-### 7. The band above the prompt
+### 11. The band above the prompt
 
 **What it is for:** knowing where you are at a glance, before you ask Claude to do anything.
 
 ```
-● uat · sandbox │ Apex: 1 untested │ Files: 3 │ Last deploy: ✔ uat 2m ago │ SF Guardian v0.10.0
+● uat · sandbox │ Apex: 1 untested │ Files: 3 │ Last deploy: ✔ uat 2m ago │ SF Guardian v0.11.0
 ```
 
 | Part | Meaning |
@@ -189,11 +240,11 @@ Both use your default org unless Claude names another.
 | `⚠ 2 findings` | Code Analyzer findings on the changed files (if Code Analyzer is on) |
 | `Last deploy: ✔ uat 2m ago` | The last deploy or validation and its result |
 | `⚠ org detection off` | sf could not list your orgs; only your settings are used |
-| `SF Guardian v0.10.0` | The mod version you are running |
+| `SF Guardian v0.11.0` | The mod version you are running |
 
 Claude is also told your default org and its class with each prompt. Turn the band off with **Org status above the prompt**.
 
-### 8. Files sidebar (`/sffiles`)
+### 12. Files sidebar (`/sffiles`)
 
 **What it is for:** seeing exactly what Claude changed, as it happens, without running `git diff`.
 
@@ -220,9 +271,10 @@ It lists every file Claude creates (`+`), edits (`~`) or deletes (`✕`), with a
 | `o` | Open the selected file in your editor, at the right line |
 | `t` | In the Coverage view: ask Claude to cover the uncovered lines |
 | `a` | Ask Claude to fix the problems shown |
+| `d` | Delete components you removed locally from the default org |
 | `Esc` | Close |
 
-### 9. Live typing
+### 13. Live typing
 
 **What it is for:** reading code while Claude writes it, so you can review it before you approve the tool.
 
@@ -230,7 +282,7 @@ While Claude writes or edits a file, a `✎` row shows the text as it is generat
 
 Drafts stay in memory only and are cleared when the turn ends. The live preview stops at 200 KB. Rows from subagents are tagged `sub`. Turn it off with **Live typing**. If it ever fails, it turns itself off for the session and says so. Claude is never affected.
 
-### 10. Validate the changed files (`v`)
+### 14. Validate the changed files (`v`)
 
 **What it is for:** checking that Claude's changes will deploy, and that their tests pass, without deploying the whole project or changing the org.
 
@@ -242,7 +294,7 @@ Press `v` in the Files sidebar. SF Guardian builds a dry-run deploy of **only th
 
 The result shows as a toast, in the band and in `/sfpanel` → Deploys. Failures feed the problems list.
 
-### 11. Problems, and "Ask Claude to fix"
+### 15. Problems, and "Ask Claude to fix"
 
 **What it is for:** going straight from a failure to the file and line, and getting Claude to fix it in one key.
 
@@ -254,13 +306,13 @@ SF Guardian collects:
 
 A file with problems gets a red `✘2` in the sidebar, and its problems show under its view. Problems in other files are listed below. Press one to select that file. Press `a` (or **Ask Claude to fix** in `/sfpanel` → Deploys) to send Claude a short digest (at most 40 lines). This only happens when you press it.
 
-### 12. Compact sf rows and summaries
+### 16. Compact sf rows and summaries
 
 **What it is for:** reading long sf output at a glance.
 
 Deploys and Apex test runs draw as one short row (`🚀 Deploy → uat ✔`, `🧪 Apex tests (AccountServiceTest) → uat`). Their results draw as a summary: passed, failed, coverage, and the first failures with file and line. Production is flagged `[PROD]`. `Ctrl+O` still shows the full output. The spinner says what sf is doing, and a toast appears when a deploy or test run ends. Turn this off with **Compact sf command rows**.
 
-### 13. Apex test tracking and coverage
+### 17. Apex test tracking and coverage
 
 **What it is for:** making sure changed Apex gets tested before you deploy.
 
@@ -268,13 +320,13 @@ Deploys and Apex test runs draw as one short row (`🚀 Deploy → uat ✔`, `�
 - Coverage from `--code-coverage` runs shows per class in `/sfpanel` → Coverage. Green is at or above **Coverage target**, yellow is 75% or above, red is below 75%.
 - With `--json` output, the uncovered lines are known: view `4` in the Files sidebar shows each uncovered range with its code (`12 uncovered lines: 40–44, 71`). Press `t` there to ask Claude to write tests for exactly those lines.
 
-### 14. Code Analyzer (optional)
+### 18. Code Analyzer (optional)
 
 **What it is for:** catching security and quality issues (CRUD/FLS, SOQL in loops, and others) in the code Claude just wrote.
 
 Turn on **Run Code Analyzer**. After a turn that changed Apex or LWC, SF Guardian runs `sf code-analyzer run` on the changed files in the background. Findings show in the band (`⚠ 3 findings`) and in the sidebar with file and line. You need the plugin (`sf plugins install code-analyzer`), and Java for some engines. `/sfdoctor` checks both.
 
-### 15. `/sfpanel`
+### 19. `/sfpanel`
 
 **What it is for:** one place for the session's Salesforce state. Tabs (press the number):
 
@@ -283,16 +335,16 @@ Turn on **Run Code Analyzer**. After a turn that changed Apex or LWC, SF Guardia
 3. **Coverage**: coverage per class, worst first, with uncovered ranges.
 4. **Limits**: key org limits (API requests, async Apex, storage, email). `r` refreshes.
 
-### 16. `/sfdoctor`
+### 20. `/sfdoctor`
 
 **What it is for:** checking the setup in a few seconds, and making a bug report useful.
 
-It prints a ✔, ⚠ or ✘ line per check, each with a fix: mod version, coding standards and prefix, Claude Code version, sf and its plugins, git, `sfdx-project.json`, default org, org detection (how many production, sandbox and scratch orgs), whether your org settings match real orgs, the file watch, sidebar width, the store, unparsed sf output, and live typing.
+It prints a ✔, ⚠ or ✘ line per check, each with a fix: mod version, team policy file, backups, coding standards and prefix, Claude Code version, sf and its plugins, git, `sfdx-project.json`, default org, org detection (how many production, sandbox and scratch orgs), whether your org settings match real orgs, the file watch, sidebar width, the store, unparsed sf output, and live typing.
 
 - `/sfdoctor record [file]`: saves the last sf output SF Guardian could not summarize (cleaned of emails, org ids and hostnames, first 2 KB) so you can attach it to a bug report. Read it first.
 - `/sfdoctor perf`: times one poll of the file watch.
 
-### 17. Smaller features
+### 21. Smaller features
 
 - **Token counts:** the turn line shows new and cached tokens separately (`3.1k tokens · 142k cached`), so cached tokens do not look like cost.
 - **Notifications** (setting **Notify when deploys and tests end**): a system notification when a deploy, validation or test run ends. Useful while you work in another window.
@@ -315,6 +367,7 @@ It prints a ✔, ⚠ or ✘ line per check, each with a fix: mod version, coding
 | `/sfguard` | The last 20 guard decisions |
 | `/sfguard test <command>` | What the guard would do, and why. Runs nothing |
 | `/sfguard orgs` | Every org with its class and where the class came from |
+| `/sfguard backups` | Backups taken before production deploys, with restore commands |
 | `/sfguard export [file]` | Write the audit log to a file |
 | `/sfdoctor` | Check the setup |
 | `/sfdoctor record [file]` | Save the last unparsed sf output, cleaned |
@@ -335,6 +388,7 @@ Set these in Claude Code with `/config` (look for SF Guardian), or from your she
 | Guard mode | `guard_mode` | `ask` | `ask` before production changes, or `block` them |
 | Guard scripts | `guard_scripts` | on | Look inside npm, make and shell scripts |
 | Guard Salesforce MCP tools | `guard_mcp` | on | Ask before MCP deploys, permission sets and org deletes |
+| Back up before production deploys | `backup_before_deploy` | on | Retrieve what a production deploy overwrites; warn about org changes not in git |
 | Allow secret commands | `allow_secret_commands` | off | Let Claude print access tokens, auth URLs and passwords |
 | Coding standards | `coding_standards` | on | Give Claude the coding standards in Salesforce projects; flag comments |
 | Component name prefix | `name_prefix` | (none) | Prefix new Apex classes, triggers and LWCs must use, e.g. `INV` |
@@ -351,7 +405,7 @@ Set these in Claude Code with `/config` (look for SF Guardian), or from your she
 | Notify when deploys and tests end | `notify` | off | System notifications |
 | Remember the file list | `remember_files` | off | Keep the list across restarts |
 
-Restart Claude Code after changing a setting.
+Restart Claude Code after changing a setting. A team policy file (`.sfguard.json`) can tighten these for everyone working in the project.
 
 ## Troubleshooting
 
