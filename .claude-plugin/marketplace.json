@@ -1,0 +1,12 @@
+{
+  "name": "sf-guard",
+  "owner": { "name": "Rahadul" },
+  "description": "SF Guardian: a Claude Code mod for Salesforce developers",
+  "plugins": [
+    {
+      "name": "sf-guardian",
+      "source": "./",
+      "description": "Salesforce helper for Claude Code: production guard that detects your orgs, live Files sidebar that shows code as Claude writes it, deploy and test failures with file and line, validate changed files, coverage, Code Analyzer, audit log, /sfdoctor"
+    }
+  ]
+}

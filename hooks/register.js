@@ -1,6 +1,6 @@
 // SF Guardian v0.9 — a Claude Code mod for Salesforce developers
 //
-// Settings live in /config (or `claude plugin configure sf-guardian@rahadul-mods`),
+// Settings live in /config (or `claude plugin configure sf-guardian@sf-guard`),
 // so updating the mod never touches them.
 //
 // Safety      Guard v2: orgs are classified from `sf org list` (production, sandbox,

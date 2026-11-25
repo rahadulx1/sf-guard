@@ -11,29 +11,40 @@ Requires Claude Code 2.1.287 or later (`claude --version`), `git`, and the Sales
 From your terminal:
 
 ```bash
-claude plugin marketplace add rahadulx1/claude-mods
-claude plugin install sf-guardian@rahadul-mods
+claude plugin marketplace add rahadulx1/sf-guard
+claude plugin install sf-guardian@sf-guard
 ```
 
 Or inside Claude Code:
 
 ```
-/plugin marketplace add rahadulx1/claude-mods
-/plugin install sf-guardian@rahadul-mods
+/plugin marketplace add rahadulx1/sf-guard
+/plugin install sf-guardian@sf-guard
 ```
 
 Restart Claude Code afterwards.
 
+**Installed it earlier from `rahadulx1/claude-mods`?** That marketplace is no longer updated. Switch once:
+
+```bash
+claude plugin uninstall sf-guardian@rahadul-mods
+claude plugin marketplace remove rahadul-mods
+claude plugin marketplace add rahadulx1/sf-guard
+claude plugin install sf-guardian@sf-guard
+```
+
+Your settings may need to be entered again in `/config`.
+
 ## Update
 
 ```bash
-claude plugin marketplace update rahadul-mods
-claude plugin update sf-guardian@rahadul-mods
+claude plugin marketplace update sf-guard
+claude plugin update sf-guardian@sf-guard
 ```
 
 Restart Claude Code afterwards. Your settings are kept. The version you are running shows at the end of the band above the prompt (`SF Guardian v0.9.0`) and on the first line of `/sfdoctor`.
 
-To update automatically, open `/plugin`, choose **Marketplaces**, select `rahadul-mods`, and choose **Enable auto-update**.
+To update automatically, open `/plugin`, choose **Marketplaces**, select `sf-guard`, and choose **Enable auto-update**.
 
 ## Quick start
 
@@ -264,7 +275,7 @@ It prints a ✔, ⚠ or ✘ line per check, each with a fix: mod version, Claude
 
 Set these in Claude Code with `/config` (look for SF Guardian), or from your shell:
 
-    echo '{"prod_orgs":"prod, admin@acme.com","safe_orgs":"my-dev-ed"}' | claude plugin configure sf-guardian@rahadul-mods --values-stdin
+    echo '{"prod_orgs":"prod, admin@acme.com","safe_orgs":"my-dev-ed"}' | claude plugin configure sf-guardian@sf-guard --values-stdin
 
 | Setting | Key | Default | Use |
 | --- | --- | --- | --- |
