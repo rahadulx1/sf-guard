@@ -1,8 +1,8 @@
 {
   "name": "sf-guardian",
   "displayName": "SF Guardian",
-  "version": "0.9.0",
-  "description": "Salesforce helper for Claude Code: a production guard that detects your orgs, live Files sidebar that shows code as Claude writes it, deploy and test failures with file and line, validate changed files, coverage, Code Analyzer, audit log, and /sfdoctor",
+  "version": "0.10.0",
+  "description": "Salesforce helper for Claude Code: production guard that detects your orgs, coding standards and naming prefix, live code checks (SOQL/DML in loops, unknown fields), org schema and SOQL tools for Claude, live Files sidebar, deploy and test failures with file and line, coverage, audit log, /sfdoctor",
   "author": {
     "name": "Rahadul"
   },
@@ -47,6 +47,24 @@
       "title": "Allow secret commands",
       "description": "Let Claude run sf org auth show-access-token, show-sfdx-auth-url and show-user-password, which print secrets into the conversation.",
       "default": false
+    },
+    "coding_standards": {
+      "type": "boolean",
+      "title": "Coding standards",
+      "description": "In Salesforce projects, give Claude the SF Guardian coding standards (simple code, no comments, complete and correct) and flag comments in code.",
+      "default": true
+    },
+    "name_prefix": {
+      "type": "string",
+      "title": "Component name prefix",
+      "description": "Prefix every NEW Apex class, trigger and LWC must use, for example INV (classes INV_Name, LWC inv_name). Empty: names are not checked.",
+      "default": ""
+    },
+    "code_checks": {
+      "type": "boolean",
+      "title": "Code checks",
+      "description": "Check Apex and LWC as Claude writes it: SOQL or DML in loops, hard-coded ids, missing sharing, System.debug, comments, and SOQL fields that do not exist in the default org.",
+      "default": true
     },
     "audit_log": {
       "type": "boolean",

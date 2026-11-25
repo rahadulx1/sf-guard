@@ -2,7 +2,15 @@
 
 All notable changes to SF Guardian. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/) (patch for fixes, minor for features). Settings keys are never repurposed.
 
-## [Unreleased]
+## [0.10.0] - 2026-11-25
+
+### Added
+- Coding standards (`coding_standards`, on): in Salesforce projects, Claude's system prompt carries the SF Guardian coding standards: simple, complete and correct code, no comments, no placeholders, no over-engineering.
+- Component name prefix (`name_prefix`, empty by default): new Apex classes, triggers and LWCs must use it (`INV_Name`, `inv_name`), with no double or trailing underscores. A file tool or `sf apex generate` / `sf lightning generate component --type lwc` with a wrong name is refused with the correct name. Existing components are never touched.
+- Code checks (`code_checks`, on), on drafts while Claude writes and on every changed file: SOQL or DML inside loops, hard-coded record ids, classes without a sharing keyword, `System.debug`, comments (when the standards are on), and SOQL fields or objects that do not exist in the default org. They join the problems list and "Ask Claude to fix".
+- Two tools Claude can call: `describe_object` (fields, types, required, lookups, picklist values, child relationships) and `soql_query` (read only, `LIMIT` added, asks first on production or unknown orgs).
+- The coverage view's `t` key asks Claude to write tests for the uncovered lines.
+
 
 ### Changed
 - SF Guardian is now installed and updated from its own repository: `claude plugin marketplace add rahadulx1/sf-guard`, then `claude plugin install sf-guardian@sf-guard`. The `rahadulx1/claude-mods` marketplace is no longer updated; the README shows how to switch.

@@ -103,6 +103,7 @@ function project(on: any, disk: Record<string, string>, opts: { cwd?: string; gi
   })
   on('session.start', ($$: any, e: any) => ({ ...e }))
   on('command.register', () => ({ value: undefined }))
+  on('tool.register', ($$: any, e: any) => ({ value: { tool: 'mcp__sf-guardian__' + e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.toast', ($$: any, e: any) => {
     state.toasts.push(String(e.text ?? e))
@@ -1136,5 +1137,181 @@ describe('0.9.0: Windows paths, memory, open in editor', () => {
     const ui = await filesPane($)
     await ui.press({ key: 'files-open' })
     expect(argv).toEqual(['code', '-g', '/project/my dir/a.cls:2'])
+  })
+})
+
+describe('0.10: coding standards, code checks, org tools', () => {
+  const SFDX = { '/project/sfdx-project.json': JSON.stringify({ packageDirectories: [{ path: 'force-app' }] }) }
+  const CLS = '/project/force-app/main/default/classes/'
+
+  test('the standards join the system prompt in a Salesforce project, with the prefix', { options: { name_prefix: 'inv' } }, async ($, on) => {
+    project(on, { ...SFDX })
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'hi', scope: 'shared' }] }))
+    const r: any = await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] } as any)
+    const own = r.sections.find((x: any) => x.id === 'sf-guardian:standards')
+    expect(own.scope).toBe('session')
+    expect(own.text).toMatch(/No Comments in Code/)
+    expect(own.text).toMatch(/INV_ContractRequestService/)
+    expect(own.text).toMatch(/<c-inv_contract-request-form>/)
+  })
+
+  test('no standards outside a Salesforce project, or when turned off', async ($, on) => {
+    project(on, {})
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'hi', scope: 'shared' }] }))
+    const r: any = await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] } as any)
+    expect(r.sections.length).toBe(1)
+  })
+
+  test('new components without the prefix are refused; existing ones and good names are not', { options: { name_prefix: 'INV' } }, async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX, [CLS + 'AccountService.cls']: 'a\n' }
+    project(on, disk)
+    const ran: string[] = []
+    on('tool.call', ($$: any, e: any) => {
+      ran.push(e.file_path ?? e.command)
+      if (e.file_path) disk[e.file_path] = String(e.content ?? 'b\n')
+      return { result: { stdout: '', stderr: '' } }
+    })
+    let r: any = await $.tool.call({ tool: 'Write', file_path: CLS + 'LeadService.cls', content: 'x' } as any)
+    expect(String(r.deny ?? r.text)).toMatch(/Rename LeadService to INV_LeadService/)
+    r = await $.tool.call({ tool: 'Write', file_path: '/project/force-app/main/default/lwc/contractForm/contractForm.js', content: 'x' } as any)
+    expect(String(r.deny ?? r.text)).toMatch(/Rename contractForm to inv_contractForm/)
+    r = await $.tool.call({ tool: 'Write', file_path: CLS + 'INV__Bad.cls', content: 'x' } as any)
+    expect(String(r.deny ?? r.text)).toMatch(/double or trailing/)
+    r = await $.tool.call({ tool: 'Bash', command: 'sf apex generate class --name LeadService --output-dir force-app/main/default/classes' })
+    expect(String(r.deny ?? r.text)).toMatch(/INV_LeadService/)
+    r = await $.tool.call({ tool: 'Bash', command: 'sf lightning generate component --name contractForm --type lwc' })
+    expect(String(r.deny ?? r.text)).toMatch(/inv_contractForm/)
+    await $.tool.call({ tool: 'Edit', file_path: CLS + 'AccountService.cls', old_string: 'a', new_string: 'b' } as any)
+    await $.tool.call({ tool: 'Write', file_path: CLS + 'INV_LeadService.cls', content: 'x' } as any)
+    await $.tool.call({ tool: 'Write', file_path: '/project/force-app/main/default/lwc/inv_contractForm/inv_contractForm.js', content: 'x' } as any)
+    await $.tool.call({ tool: 'Bash', command: 'sf apex generate class --name INV_LeadServiceTest' })
+    expect(ran).toEqual([CLS + 'AccountService.cls', CLS + 'INV_LeadService.cls', '/project/force-app/main/default/lwc/inv_contractForm/inv_contractForm.js', 'sf apex generate class --name INV_LeadServiceTest'])
+  })
+
+  test('without a prefix set, names are not checked', async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX }
+    project(on, disk)
+    on('tool.call', ($$: any, e: any) => {
+      disk[e.file_path] = 'x'
+      return { result: 'ok' }
+    })
+    const r: any = await $.tool.call({ tool: 'Write', file_path: CLS + 'LeadService.cls', content: 'x' } as any)
+    expect(r.deny).toBeUndefined()
+  })
+
+  test('code checks mark the file and list the problems; unknown fields are caught', async ($, on) => {
+    const source = [
+      'public class INV_Sync {',
+      '  public static void run(List<Account> accts) {',
+      '    for (Account a : accts) {',
+      '      List<Contact> cs = [SELECT Id, Bogus__c FROM Contact WHERE AccountId = :a.Id];',
+      '    }',
+      '  }',
+      '}',
+    ].join('\n')
+    const disk: Record<string, string> = { ...SFDX }
+    project(on, disk, {
+      run: (argv) =>
+        argv.startsWith('sf sobject describe --sobject Contact')
+          ? { value: { exitCode: 0, stdout: JSON.stringify({ status: 0, result: { name: 'Contact', fields: [{ name: 'Id' }, { name: 'AccountId' }] } }), stderr: '' } }
+          : undefined,
+    })
+    on('tool.call', ($$: any, e: any) => {
+      disk[e.file_path] = e.content
+      return { result: 'ok' }
+    })
+    await start($)
+    await $.tool.call({ tool: 'Write', file_path: CLS + 'INV_Sync.cls', content: source } as any)
+    const ui = await filesPane($)
+    expect(await ui.find({ type: 'Text', text: /line 1  Class without a sharing keyword/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /line 4  SOQL inside a loop/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /line 4  Field Contact\.Bogus__c does not exist in uat/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '✘3' })).toBeDefined()
+  })
+
+  test('comments are flagged while Claude is still writing', async ($, on) => {
+    project(on, { ...SFDX })
+    on('turn.step', async function* () {
+      yield { kind: 'tool', index: 0, id: 'tu-c', name: 'Write' }
+      yield { kind: 'input', index: 0, json: '{"file_path":"' + CLS + 'INV_A.cls","content":"public with sharing class INV_A {\\n  // explain\\n' }
+      return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'tool_use', usage: null }
+    })
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 } as any)) {
+      // drain
+    }
+    const ui = await filesPane($)
+    expect(await ui.find({ type: 'Text', text: /line 2  Comment in code/ })).toBeDefined()
+  })
+
+  test('code checks can be turned off', { options: { code_checks: false } }, async ($, on) => {
+    const disk: Record<string, string> = { ...SFDX }
+    project(on, disk)
+    on('tool.call', ($$: any, e: any) => {
+      disk[e.file_path] = e.content
+      return { result: 'ok' }
+    })
+    await $.tool.call({ tool: 'Write', file_path: CLS + 'INV_B.cls', content: 'public class INV_B {\n  // x\n}\n' } as any)
+    const ui = await filesPane($)
+    expect(await ui.find({ type: 'Text', text: /Comment in code|sharing keyword/ })).toBeUndefined()
+  })
+
+  test('describe_object returns fields; soql_query adds a limit, asks on production, strips attributes', async ($, on) => {
+    const calls: string[] = []
+    project(on, {}, {
+      orgList: ORG_LIST.result,
+      run: (argv) => {
+        if (argv.startsWith('sf sobject describe --sobject Account')) {
+          return { value: { exitCode: 0, stdout: JSON.stringify({ result: { name: 'Account', label: 'Account', fields: [{ name: 'Name', type: 'string', length: 255, label: 'Account Name', nillable: false, createable: true }, { name: 'ParentId', type: 'reference', referenceTo: ['Account'], relationshipName: 'Parent', label: 'Parent', nillable: true }, { name: 'Type', type: 'picklist', label: 'Type', nillable: true, picklistValues: [{ value: 'Customer', active: true }] }], childRelationships: [{ relationshipName: 'Contacts', childSObject: 'Contact', field: 'AccountId' }] } }), stderr: '' } }
+        }
+        if (argv.startsWith('sf data query')) {
+          calls.push(argv)
+          return { value: { exitCode: 0, stdout: JSON.stringify({ status: 0, result: { totalSize: 1, done: true, records: [{ attributes: { type: 'Account' }, Id: '001', Name: 'Acme' }] } }), stderr: '' } }
+        }
+        return undefined
+      },
+    })
+    store(on)
+    const seen = bash(on, 'Cancel')
+    await start($)
+    const d: any = await $.tool.run({ tool: 'mcp__sf-guardian__describe_object', object: 'Account' } as any)
+    expect(d.result).toMatch(/Name  string\(255\)  "Account Name"  required/)
+    expect(d.result).toMatch(/ParentId  reference → Account \(Parent\)/)
+    expect(d.result).toMatch(/Type  picklist  "Type"  \[Customer\]/)
+    expect(d.result).toMatch(/Contacts → Contact\.AccountId/)
+    const q: any = await $.tool.run({ tool: 'mcp__sf-guardian__soql_query', query: 'SELECT Id, Name FROM Account', org: 'uat' } as any)
+    expect(calls[0]).toMatch(/SELECT Id, Name FROM Account LIMIT 50/)
+    expect(q.result).not.toMatch(/attributes/)
+    expect(JSON.parse(q.result).records[0]).toEqual({ Id: '001', Name: 'Acme' })
+    const p: any = await $.tool.run({ tool: 'mcp__sf-guardian__soql_query', query: 'SELECT Id FROM Account LIMIT 5000', org: 'prod' } as any)
+    expect(seen.asked[0]).toMatch(/read records from prod \(production\)[\s\S]*LIMIT 200/)
+    expect(String(p.deny)).toMatch(/did not allow/)
+    expect(calls.length).toBe(1)
+    const bad: any = await $.tool.run({ tool: 'mcp__sf-guardian__soql_query', query: 'DELETE FROM Account', org: 'uat' } as any)
+    expect(String(bad.deny)).toMatch(/Only SELECT/)
+  })
+
+  test('the coverage view asks Claude to cover the uncovered lines', async ($, on) => {
+    const path = '/project/force-app/main/default/classes/AccountService.cls'
+    const disk: Record<string, string> = { [path]: Array.from({ length: 80 }, (_, i) => 'line ' + (i + 1)).join('\n') + '\n' }
+    project(on, disk)
+    let sent = ''
+    on('prompt.submit', ($$: any, e: any) => {
+      sent = e.text
+      return { text: e.text }
+    })
+    on('tool.call', ($$: any, e: any) => {
+      if (e.tool === 'Edit') {
+        disk[path] = disk[path].replace('line 1\n', 'LINE 1\n')
+        return { result: 'ok' }
+      }
+      return { result: { stdout: JSON.stringify(APEX_PASS), stderr: '' } }
+    })
+    await $.tool.call({ tool: 'Edit', file_path: path, old_string: 'line 1', new_string: 'LINE 1' } as any)
+    await $.tool.call({ tool: 'Bash', command: 'sf apex run test -n AccountServiceTest -o uat --code-coverage --json --wait 10' })
+    const ui = await filesPane($)
+    await ui.press({ key: 'files-view-coverage' })
+    await ui.press({ key: 'files-cover' })
+    expect(sent).toMatch(/AccountService covers lines 40–44, 71 \(now 88%\)/)
+    expect(sent).toMatch(/--class-names AccountServiceTest --code-coverage --json --wait 10/)
   })
 })

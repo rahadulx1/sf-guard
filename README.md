@@ -1,6 +1,6 @@
 # SF Guardian
 
-A Claude Code mod for Salesforce developers. It stops Claude from changing production by accident, shows which org you are in, shows every file Claude changes (even while Claude is still writing it), and turns sf CLI output into file-and-line problems you can act on.
+A Claude Code mod for Salesforce developers. It stops Claude from changing production by accident, gives Claude your coding standards and naming prefix, checks Claude's Apex and LWC while it is written (SOQL in loops, made-up fields), lets Claude look up your org's schema, shows every file Claude changes, and turns sf CLI output into file-and-line problems you can act on.
 
 **Contents:** [Install](#install) · [Update](#update) · [Quick start](#quick-start) · [Manual](#manual) · [Commands](#commands) · [Settings](#settings) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
@@ -42,7 +42,7 @@ claude plugin marketplace update sf-guard
 claude plugin update sf-guardian@sf-guard
 ```
 
-Restart Claude Code afterwards. Your settings are kept. The version you are running shows at the end of the band above the prompt (`SF Guardian v0.9.0`) and on the first line of `/sfdoctor`.
+Restart Claude Code afterwards. Your settings are kept. The version you are running shows at the end of the band above the prompt (`SF Guardian v0.10.0`) and on the first line of `/sfdoctor`.
 
 To update automatically, open `/plugin`, choose **Marketplaces**, select `sf-guard`, and choose **Enable auto-update**.
 
@@ -113,7 +113,54 @@ To update automatically, open `/plugin`, choose **Marketplaces**, select `sf-gua
 - Reading files under `~/.sf` and `~/.sfdx` (where sf keeps login data) asks first, whether Claude uses a file tool or a shell command such as `cat`.
 - Salesforce session ids (`00D…!…`) and sfdx auth URLs (`force://…@…`) are removed from shell output before Claude reads it.
 
-### 3. `/sfguard`: see and test the guard's decisions
+### 3. Coding standards and component names
+
+**What it is for:** getting code that looks like your team wrote it (simple, complete, no comments) and keeping your naming rule without reminding Claude every time.
+
+- **Coding standards** (setting **Coding standards**, on): in a Salesforce project (one with `sfdx-project.json`), Claude's system prompt carries the SF Guardian standards. Code should be simple and correct, with no comments, no placeholders, no speculative features and no over-engineering. Claude should check its work before saying it's done.
+- **Name prefix** (setting **Component name prefix**, empty by default): set it to your prefix, for example `INV`, and every *new* component must use it:
+
+  | Component | Rule | Example |
+  | --- | --- | --- |
+  | Apex class | `INV_` + PascalCase | `INV_ContractRequestService` |
+  | Apex test class | `INV_` + name + test suffix | `INV_ContractRequestServiceTest` |
+  | Apex trigger | `INV_` + PascalCase | `INV_ContractRequestTrigger` |
+  | Lightning Web Component | `inv_` + camelCase | `inv_contractRequestForm`, used as `<c-inv_contract-request-form>` |
+
+  No double underscores, and no trailing underscore. If Claude tries to create a component with the wrong name, through a file tool or with `sf apex generate class|trigger` or `sf lightning generate component --type lwc`, the call is refused and Claude is told the correct name. Existing components are never renamed or blocked.
+
+Set the prefix with `/config`, or:
+
+    echo '{"name_prefix":"INV"}' | claude plugin configure sf-guardian@sf-guard --values-stdin
+
+### 4. Code checks (live)
+
+**What it is for:** catching governor-limit bugs and made-up fields *while Claude writes the code*, before you approve it and long before a deploy fails.
+
+Checked on drafts (live typing) and on every changed Apex class, trigger and LWC file:
+
+| Check | Example message |
+| --- | --- |
+| SOQL inside a loop | `line 12  SOQL inside a loop: query once before the loop` |
+| DML inside a loop | `line 14  DML inside a loop: collect records and run one DML after the loop` |
+| Hard-coded record id | `line 3  Hard-coded record id 0015g00000AbCdE` |
+| Class without a sharing keyword | `line 1  Class without a sharing keyword: …` |
+| `System.debug` left in code | `line 20  System.debug left in code` |
+| Comments in code (when the standards are on) | `line 5  Comment in code: your coding standards allow none` (tool directives such as `eslint-disable` or `NOPMD` are allowed) |
+| SOQL field or object that does not exist in your default org | `line 8  Field Contact.Bogus__c does not exist in uat` |
+
+Problems show under the draft or the file in the Files sidebar, mark the file with `✘`, and are included when you press `a` to ask Claude to fix them. Field checks use `sf sobject describe` on your default org (read only, cached for the session). Turn the checks off with **Code checks**.
+
+### 5. Tools Claude can call: `describe_object` and `soql_query`
+
+**What it is for:** letting Claude look things up in your org instead of guessing.
+
+- **`describe_object`**: every field of an object with its API name, type, label, whether it is required, lookup targets and picklist values, plus child relationships. Claude uses it before writing code that references fields. Read only.
+- **`soql_query`**: runs a read-only `SELECT` and returns the records as JSON. `LIMIT 50` is added when the query has none, and limits above 200 are lowered to 200. Before reading data from a **production or unknown** org, you're asked, and the answer is recorded in the audit log.
+
+Both use your default org unless Claude names another.
+
+### 6. `/sfguard`: see and test the guard's decisions
 
 **What it is for:** trusting the guard, and finding out why it asked (or did not).
 
@@ -124,12 +171,12 @@ To update automatically, open `/plugin`, choose **Marketplaces**, select `sf-gua
 
 **Audit log** (setting **Audit log**): every guarded command is recorded locally: the last 500, with passwords, client secrets, session ids and auth URLs removed. Nothing is sent anywhere.
 
-### 4. The band above the prompt
+### 7. The band above the prompt
 
 **What it is for:** knowing where you are at a glance, before you ask Claude to do anything.
 
 ```
-● uat · sandbox │ Apex: 1 untested │ Files: 3 │ Last deploy: ✔ uat 2m ago │ SF Guardian v0.9.0
+● uat · sandbox │ Apex: 1 untested │ Files: 3 │ Last deploy: ✔ uat 2m ago │ SF Guardian v0.10.0
 ```
 
 | Part | Meaning |
@@ -142,11 +189,11 @@ To update automatically, open `/plugin`, choose **Marketplaces**, select `sf-gua
 | `⚠ 2 findings` | Code Analyzer findings on the changed files (if Code Analyzer is on) |
 | `Last deploy: ✔ uat 2m ago` | The last deploy or validation and its result |
 | `⚠ org detection off` | sf could not list your orgs; only your settings are used |
-| `SF Guardian v0.9.0` | The mod version you are running |
+| `SF Guardian v0.10.0` | The mod version you are running |
 
 Claude is also told your default org and its class with each prompt. Turn the band off with **Org status above the prompt**.
 
-### 5. Files sidebar (`/sffiles`)
+### 8. Files sidebar (`/sffiles`)
 
 **What it is for:** seeing exactly what Claude changed, as it happens, without running `git diff`.
 
@@ -159,7 +206,7 @@ It lists every file Claude creates (`+`), edits (`~`) or deletes (`✕`), with a
 | `1` | Latest change | Review the change Claude just made |
 | `2` | All changes | See everything changed in this file this session |
 | `3` | File | Read the file around the latest change, or around the first problem |
-| `4` | Coverage | See which lines of the selected Apex class no test covers |
+| `4` | Coverage | See which lines of the selected Apex class no test covers. Press `t` to ask Claude to write tests for exactly those lines |
 
 **Keys:**
 
@@ -169,12 +216,13 @@ It lists every file Claude creates (`+`), edits (`~`) or deletes (`✕`), with a
 | `f` | Follow: always select the latest change (moving by hand turns it off) |
 | `x` | Clear the list. A file shows again when it next changes, diffed from what you cleared |
 | `r` | Refresh now |
-| `v` | Validate the changed files (see 7) |
+| `v` | Validate the changed files |
 | `o` | Open the selected file in your editor, at the right line |
-| `a` | Ask Claude to fix the problems shown (see 8) |
+| `t` | In the Coverage view: ask Claude to cover the uncovered lines |
+| `a` | Ask Claude to fix the problems shown |
 | `Esc` | Close |
 
-### 6. Live typing
+### 9. Live typing
 
 **What it is for:** reading code while Claude writes it, so you can review it before you approve the tool.
 
@@ -182,7 +230,7 @@ While Claude writes or edits a file, a `✎` row shows the text as it is generat
 
 Drafts stay in memory only and are cleared when the turn ends. The live preview stops at 200 KB. Rows from subagents are tagged `sub`. Turn it off with **Live typing**. If it ever fails, it turns itself off for the session and says so. Claude is never affected.
 
-### 7. Validate the changed files (`v`)
+### 10. Validate the changed files (`v`)
 
 **What it is for:** checking that Claude's changes will deploy, and that their tests pass, without deploying the whole project or changing the org.
 
@@ -194,38 +242,39 @@ Press `v` in the Files sidebar. SF Guardian builds a dry-run deploy of **only th
 
 The result shows as a toast, in the band and in `/sfpanel` → Deploys. Failures feed the problems list.
 
-### 8. Problems, and "Ask Claude to fix"
+### 11. Problems, and "Ask Claude to fix"
 
 **What it is for:** going straight from a failure to the file and line, and getting Claude to fix it in one key.
 
 SF Guardian collects:
 - **Deploy errors** with file, line and column: `✘ AccountService.cls:34:12  Variable does not exist: foo`
 - **Failing tests**, with the class and line from the stack trace
+- **Code check problems** (see the live code checks section)
 - **Code Analyzer findings** (if Code Analyzer is on)
 
 A file with problems gets a red `✘2` in the sidebar, and its problems show under its view. Problems in other files are listed below. Press one to select that file. Press `a` (or **Ask Claude to fix** in `/sfpanel` → Deploys) to send Claude a short digest (at most 40 lines). This only happens when you press it.
 
-### 9. Compact sf rows and summaries
+### 12. Compact sf rows and summaries
 
 **What it is for:** reading long sf output at a glance.
 
 Deploys and Apex test runs draw as one short row (`🚀 Deploy → uat ✔`, `🧪 Apex tests (AccountServiceTest) → uat`). Their results draw as a summary: passed, failed, coverage, and the first failures with file and line. Production is flagged `[PROD]`. `Ctrl+O` still shows the full output. The spinner says what sf is doing, and a toast appears when a deploy or test run ends. Turn this off with **Compact sf command rows**.
 
-### 10. Apex test tracking and coverage
+### 13. Apex test tracking and coverage
 
 **What it is for:** making sure changed Apex gets tested before you deploy.
 
 - Classes Claude edits are listed as untested until a passing test run covers them. At the end of a turn with untested Apex, Claude gets a reminder with the exact test command.
 - Coverage from `--code-coverage` runs shows per class in `/sfpanel` → Coverage. Green is at or above **Coverage target**, yellow is 75% or above, red is below 75%.
-- With `--json` output, the uncovered lines are known: view `4` in the Files sidebar shows each uncovered range with its code (`12 uncovered lines: 40–44, 71`).
+- With `--json` output, the uncovered lines are known: view `4` in the Files sidebar shows each uncovered range with its code (`12 uncovered lines: 40–44, 71`). Press `t` there to ask Claude to write tests for exactly those lines.
 
-### 11. Code Analyzer (optional)
+### 14. Code Analyzer (optional)
 
 **What it is for:** catching security and quality issues (CRUD/FLS, SOQL in loops, and others) in the code Claude just wrote.
 
 Turn on **Run Code Analyzer**. After a turn that changed Apex or LWC, SF Guardian runs `sf code-analyzer run` on the changed files in the background. Findings show in the band (`⚠ 3 findings`) and in the sidebar with file and line. You need the plugin (`sf plugins install code-analyzer`), and Java for some engines. `/sfdoctor` checks both.
 
-### 12. `/sfpanel`
+### 15. `/sfpanel`
 
 **What it is for:** one place for the session's Salesforce state. Tabs (press the number):
 
@@ -234,16 +283,16 @@ Turn on **Run Code Analyzer**. After a turn that changed Apex or LWC, SF Guardia
 3. **Coverage**: coverage per class, worst first, with uncovered ranges.
 4. **Limits**: key org limits (API requests, async Apex, storage, email). `r` refreshes.
 
-### 13. `/sfdoctor`
+### 16. `/sfdoctor`
 
 **What it is for:** checking the setup in a few seconds, and making a bug report useful.
 
-It prints a ✔, ⚠ or ✘ line per check, each with a fix: mod version, Claude Code version, sf and its plugins, git, `sfdx-project.json`, default org, org detection (how many production, sandbox and scratch orgs), whether your org settings match real orgs, the file watch, sidebar width, the store, unparsed sf output, and live typing.
+It prints a ✔, ⚠ or ✘ line per check, each with a fix: mod version, coding standards and prefix, Claude Code version, sf and its plugins, git, `sfdx-project.json`, default org, org detection (how many production, sandbox and scratch orgs), whether your org settings match real orgs, the file watch, sidebar width, the store, unparsed sf output, and live typing.
 
 - `/sfdoctor record [file]`: saves the last sf output SF Guardian could not summarize (cleaned of emails, org ids and hostnames, first 2 KB) so you can attach it to a bug report. Read it first.
 - `/sfdoctor perf`: times one poll of the file watch.
 
-### 14. Smaller features
+### 17. Smaller features
 
 - **Token counts:** the turn line shows new and cached tokens separately (`3.1k tokens · 142k cached`), so cached tokens do not look like cost.
 - **Notifications** (setting **Notify when deploys and tests end**): a system notification when a deploy, validation or test run ends. Useful while you work in another window.
@@ -271,6 +320,8 @@ It prints a ✔, ⚠ or ✘ line per check, each with a fix: mod version, Claude
 | `/sfdoctor record [file]` | Save the last unparsed sf output, cleaned |
 | `/sfdoctor perf` | Time one poll of the file watch |
 
+Claude also gets two tools from SF Guardian: `describe_object` and `soql_query`.
+
 ## Settings
 
 Set these in Claude Code with `/config` (look for SF Guardian), or from your shell:
@@ -285,6 +336,9 @@ Set these in Claude Code with `/config` (look for SF Guardian), or from your she
 | Guard scripts | `guard_scripts` | on | Look inside npm, make and shell scripts |
 | Guard Salesforce MCP tools | `guard_mcp` | on | Ask before MCP deploys, permission sets and org deletes |
 | Allow secret commands | `allow_secret_commands` | off | Let Claude print access tokens, auth URLs and passwords |
+| Coding standards | `coding_standards` | on | Give Claude the coding standards in Salesforce projects; flag comments |
+| Component name prefix | `name_prefix` | (none) | Prefix new Apex classes, triggers and LWCs must use, e.g. `INV` |
+| Code checks | `code_checks` | on | Live checks for loops, ids, sharing, debug, comments, unknown fields |
 | Audit log | `audit_log` | on | Keep a local record of guarded commands |
 | Open the Files sidebar automatically | `auto_open_files` | on | Open it at the first change |
 | Live typing | `live_typing` | on | Show text while Claude writes it |

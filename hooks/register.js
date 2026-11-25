@@ -21,9 +21,11 @@
 
 import { splitLines, unifiedDiff } from './lib/diff.js'
 import { createDrafts, tailLines } from './lib/draft.js'
-import { allSimpleCommands, programName, tokenize } from './lib/shell.js'
-import { classifyOrgs, compareApi, daysUntil, orgClass, orgEntry, slimOrgList, uniqueOrgs } from './lib/orgs.js'
+import { allSimpleCommands, flagValue, programName, tokenize } from './lib/shell.js'
+import { classifyOrgs, compareApi, daysUntil, needsAsk, orgClass, orgEntry, slimOrgList, uniqueOrgs } from './lib/orgs.js'
 import { CATEGORY_LABEL, applyDryRun, changesLogins, choicesFor, decide, mcpToolOf, questionFor, scriptRefOf, sfCommandOf } from './lib/guard.js'
+import { componentOf, lintSource, namingProblem, soqlFields } from './lib/lint.js'
+import { normalizePrefix, standardsText } from './lib/standards.js'
 import {
   failureLine,
   isUnknownCommand,
@@ -59,10 +61,13 @@ const cfg = {
   editorCommand: 'code',
   notify: false,
   rememberFiles: false,
+  codingStandards: true,
+  namePrefix: '',
+  codeChecks: true,
 }
 const COVERAGE_MIN = 75
 const MIN_CLAUDE = '2.1.287'
-let modVersion = '0.9.0' // read from plugin.json at session start; this is the fallback
+let modVersion = '0.10.0' // read from plugin.json at session start; this is the fallback
 
 const PANE = 'sf-guardian'
 const FILES_PANE = 'sf-files'
@@ -124,6 +129,8 @@ let lastTestProblems = [] // { name, message, cls, line }
 let analyzerFindings = [] // { file, line, col, problem, rule, severity }
 let analyzerRunning = false
 let validating = false
+const describeCache = new Map()
+let describing = null
 
 // Live typing
 const drafts = createDrafts()
@@ -178,6 +185,9 @@ function applyOptions(options) {
   bool('code_analyzer', 'codeAnalyzer')
   bool('notify', 'notify')
   bool('remember_files', 'rememberFiles')
+  bool('coding_standards', 'codingStandards')
+  bool('code_checks', 'codeChecks')
+  cfg.namePrefix = normalizePrefix(o.name_prefix)
   const width = Number(o.files_pane_width)
   if (Number.isFinite(width) && width >= 40) cfg.filesPaneWidth = Math.min(160, Math.round(width))
   const target = Number(o.coverage_target)
@@ -707,6 +717,8 @@ function recordChange(f, before, after) {
   f.binary = isBinary(f.path, after) || isBinary(f.path, before)
   const big = (x) => typeof x === 'string' && x.length > MAX_TRACKED_BYTES
   f.tooLarge = big(after) || big(before) || big(f.original)
+  f.lint = cfg.codeChecks && !f.binary && !f.tooLarge ? lintSource(f.path, after, { noComments: cfg.codingStandards }) : []
+  f.soql = cfg.codeChecks && !f.binary && !f.tooLarge ? soqlFields(f.path, after) : []
   if (f.binary || f.tooLarge) {
     f.allDiff = ''
     f.latestDiff = ''
@@ -924,6 +936,7 @@ async function poll($) {
   if (await refreshTracked($)) changed = true
   if (changed) {
     trimMemory()
+    void ensureDescribes($)
     await autoOpenFiles($)
     $.ui.invalidate('ui.render')
   }
@@ -1181,9 +1194,68 @@ function problemMatches(path, file) {
   return path.endsWith('/' + p) || path === p
 }
 
+function describeKey(org, object) {
+  return String(org).toLowerCase() + '|' + String(object).toLowerCase()
+}
+
+function fieldProblems(refs) {
+  if (!defaultOrg || !refs?.length) return []
+  const out = []
+  for (const r of refs) {
+    const known = describeCache.get(describeKey(defaultOrg, r.object))
+    if (!known) continue
+    if (known.missing) out.push({ line: r.line, rule: 'schema', problem: 'Object ' + r.object + ' does not exist in ' + defaultOrg })
+    else if (!known.fields.has(r.field.toLowerCase())) out.push({ line: r.line, rule: 'schema', problem: 'Field ' + r.object + '.' + r.field + ' does not exist in ' + defaultOrg })
+  }
+  return out
+}
+
+function codeProblems(f) {
+  const file = f.path.split('/').pop()
+  return [...(f.lint ?? []), ...fieldProblems(f.soql)].map((p) => ({ file, line: p.line, problem: p.problem, rule: p.rule, source: p.rule === 'schema' ? 'schema' : 'lint' }))
+}
+
+async function fetchDescribe($, org, object) {
+  try {
+    const r = await $.process.run(['sf', 'sobject', 'describe', '--sobject', object, '--json', '-o', org], { timeoutMs: 60000 })
+    const j = JSON.parse(r.stdout || '{}')
+    if (r.exitCode === 0 && j.result) return j.result
+    if (/not found|NOT_FOUND|INVALID_TYPE/i.test(String(j.name ?? '') + String(j.message ?? ''))) return { missing: true }
+    return null
+  } catch {
+    return null
+  }
+}
+
+async function cacheDescribe($, org, object) {
+  const key = describeKey(org, object)
+  if (describeCache.has(key)) return describeCache.get(key)
+  const d = await fetchDescribe($, org, object)
+  if (!d) return null
+  const entry = d.missing ? { missing: true } : { fields: new Set((d.fields ?? []).map((x) => String(x.name).toLowerCase())), describe: d }
+  describeCache.set(key, entry)
+  return entry
+}
+
+function ensureDescribes($) {
+  if (!cfg.codeChecks || !defaultOrg || describing) return describing
+  const wanted = new Set()
+  for (const f of files.values()) for (const r of f.soql ?? []) if (!describeCache.has(describeKey(defaultOrg, r.object))) wanted.add(r.object)
+  if (wanted.size === 0) return null
+  describing = (async () => {
+    for (const object of [...wanted].slice(0, 10)) await cacheDescribe($, defaultOrg, object)
+    $.ui.invalidate('ui.render')
+  })().finally(() => {
+    describing = null
+  })
+  return describing
+}
+
 function problemsFor(path) {
   const out = []
   const base = path.split('/').pop()
+  const tracked = files.get(path)
+  if (tracked) for (const p of codeProblems(tracked)) out.push(p)
   for (const p of lastDeployProblems) if (problemMatches(path, p.file)) out.push({ ...p, source: 'deploy' })
   for (const t of lastTestProblems) if (t.cls && (base === t.cls + '.cls' || base === t.cls + '.trigger')) out.push({ file: base, line: t.line, problem: t.name + ': ' + t.message, source: 'test' })
   for (const a of analyzerFindings) if (problemMatches(path, a.file)) out.push({ ...a, problem: (a.rule ? a.rule + ': ' : '') + a.problem, source: 'analyzer' })
@@ -1195,6 +1267,7 @@ function allProblems() {
     ...lastDeployProblems.map((p) => ({ ...p, source: 'deploy' })),
     ...lastTestProblems.map((t) => ({ file: t.cls ? t.cls + '.cls' : null, line: t.line, problem: t.name + (t.message ? ': ' + t.message : ''), source: 'test' })),
     ...analyzerFindings.map((a) => ({ ...a, problem: (a.rule ? a.rule + ': ' : '') + a.problem, source: 'analyzer' })),
+    ...[...files.values()].filter((f) => f.status !== 'deleted').flatMap(codeProblems),
   ]
 }
 
@@ -1215,6 +1288,11 @@ function fixDigest() {
   if (lastTestProblems.length) {
     lines.push('', 'Failing tests:')
     for (const t of lastTestProblems.slice(0, 10)) lines.push('- ' + t.name + (t.line ? ' (line ' + t.line + ')' : '') + (t.message ? ': ' + t.message : ''))
+  }
+  const checks = [...files.values()].filter((f) => f.status !== 'deleted').flatMap((f) => codeProblems(f).map((p) => ({ ...p, rel: projectRel(f.path) })))
+  if (checks.length) {
+    lines.push('', 'Code checks:')
+    for (const p of checks.slice(0, 12)) lines.push('- ' + p.rel + ':' + p.line + '  ' + p.problem)
   }
   if (analyzerFindings.length) {
     lines.push('', 'Code Analyzer findings:')
@@ -1383,6 +1461,97 @@ async function validateChanged($) {
   })()
 }
 
+async function newComponentProblem($, tool, file) {
+  if (!cfg.namePrefix || !file || READ_ONLY_TOOLS.has(tool)) return null
+  const comp = componentOf(absPath(file))
+  if (!comp) return null
+  const existing = comp.kind === 'lwc' ? comp.folder : absPath(file).replace(/-meta\.xml$/, '')
+  try {
+    if (await $.fs.exists(existing)) return null
+  } catch {
+    return null
+  }
+  return namingProblem(comp.kind, comp.name, cfg.namePrefix)
+}
+
+function generatedNameProblem(command) {
+  if (!cfg.namePrefix) return null
+  for (const seg of allSimpleCommands(command)) {
+    const sf = sfCommandOf(tokenize(seg))
+    if (!sf) continue
+    const isLwc = sf.topic.startsWith('lightning generate component') && flagValue(sf.words, ['--type']) === 'lwc'
+    const kind = sf.topic.startsWith('apex generate class') ? 'class' : sf.topic.startsWith('apex generate trigger') ? 'trigger' : isLwc ? 'lwc' : null
+    const problem = kind && namingProblem(kind, flagValue(sf.words, ['--name'], ['-n']), cfg.namePrefix)
+    if (problem) return problem
+  }
+  return null
+}
+
+function describeSummary(d, org) {
+  const lines = [d.name + ' in ' + org + ' (' + (d.label ?? d.name) + '): ' + plural((d.fields ?? []).length, 'field')]
+  for (const f of (d.fields ?? []).slice(0, 400)) {
+    const type = f.type === 'reference' ? 'reference → ' + (f.referenceTo ?? []).join('|') + (f.relationshipName ? ' (' + f.relationshipName + ')' : '') : f.type + (f.length ? '(' + f.length + ')' : '')
+    const required = f.nillable === false && f.createable && !f.defaultedOnCreate ? '  required' : ''
+    const picks = (f.picklistValues ?? []).filter((v) => v.active !== false).map((v) => v.value)
+    const values = picks.length ? '  [' + picks.slice(0, 25).join(', ') + (picks.length > 25 ? ', …' : '') + ']' : ''
+    lines.push(f.name + '  ' + type + '  "' + f.label + '"' + required + (f.updateable === false && f.createable === false ? '  read only' : '') + values)
+  }
+  const children = (d.childRelationships ?? []).filter((c) => c.relationshipName).slice(0, 60)
+  if (children.length) lines.push('Child relationships: ' + children.map((c) => c.relationshipName + ' → ' + c.childSObject + '.' + c.field).join(', '))
+  return lines.join('\n')
+}
+
+function stripAttributes(value) {
+  if (Array.isArray(value)) return value.map(stripAttributes)
+  if (!value || typeof value !== 'object') return value
+  const out = {}
+  for (const [k, v] of Object.entries(value)) if (k !== 'attributes') out[k] = stripAttributes(v)
+  return out
+}
+
+function limitQuery(query) {
+  const m = query.match(/\blimit\s+(\d+)\s*$/i)
+  if (!m) return query + ' LIMIT 50'
+  return Number(m[1]) > 200 ? query.slice(0, m.index) + 'LIMIT 200' : query
+}
+
+async function describeTool($, e) {
+  const object = String(e.object ?? '').trim()
+  if (!/^\w+$/.test(object)) return { deny: 'Give an object API name, such as Account or Invoice__c.' }
+  const org = String(e.org ?? '').trim() || defaultOrg
+  if (!org) return { deny: 'No org given and no default org set. Run: sf config set target-org <alias>' }
+  const entry = await cacheDescribe($, org, object)
+  if (!entry) return { deny: 'Could not describe ' + object + ' in ' + org + '. Check that sf is installed and the org is logged in (sf org display -o ' + org + ').' }
+  if (entry.missing) return { deny: object + ' does not exist in ' + org + '.' }
+  return { result: describeSummary(entry.describe, org) }
+}
+
+async function soqlTool($, e) {
+  const query = String(e.query ?? '').trim().replace(/;+$/, '')
+  if (!/^select\s/i.test(query)) return { deny: 'Only SELECT queries are allowed.' }
+  const org = String(e.org ?? '').trim() || defaultOrg
+  if (!org) return { deny: 'No org given and no default org set. Run: sf config set target-org <alias>' }
+  await orgsForGuard($)
+  const cls = clsOf(org)
+  const limited = limitQuery(query)
+  if (needsAsk(cls)) {
+    const answer = await askPerson($, 'Claude wants to read records from ' + org + ' (' + cls + '):\n' + limited, ['Run query', 'Cancel'])
+    await audit($, { command: 'soql_query ' + limited, org, cls, verdict: 'ask', answer: answer ?? 'no answer', reason: 'reading data from a ' + cls + ' org', outcome: answer === 'Run query' ? 'ran' : 'cancelled' })
+    if (answer !== 'Run query') return { deny: 'The user did not allow this query on ' + org + '. Ask before querying it again.' }
+  }
+  let r
+  try {
+    r = await $.process.run(['sf', 'data', 'query', '--query', limited, '--json', '-o', org], { timeoutMs: 120000 })
+  } catch {
+    return { deny: 'Could not run sf. Is the Salesforce CLI installed?' }
+  }
+  const j = parseJsonSafe(r.stdout)
+  if (r.exitCode !== 0 || !j?.result) return { deny: 'Query failed: ' + String(j?.message ?? r.stderr ?? 'unknown error').split('\n')[0] }
+  const records = stripAttributes(j.result.records ?? [])
+  const text = JSON.stringify({ org, query: limited, totalSize: j.result.totalSize, returned: records.length, records }, null, 1)
+  return { result: scrubSecrets(text.length > 50000 ? text.slice(0, 50000) + '\n[cut at 50,000 characters]' : text).text }
+}
+
 // ── Open in editor ──────────────────────────────────────────────────────────
 async function openInEditor($, path, line) {
   const parts = cfg.editorCommand.split(/\s+/).filter(Boolean)
@@ -1431,6 +1600,17 @@ function draftStatusText(d) {
   return 'drafting…'
 }
 
+function problemColor(p) {
+  return p.source === 'analyzer' || p.source === 'lint' ? 'yellow' : 'red'
+}
+
+function draftChecks(d, path, note) {
+  if (!cfg.codeChecks || !path) return []
+  const text = d.kind === 'write' ? d.text : d.edits.map((e) => e.newText).join('\n')
+  const found = [...lintSource(path, text, { noComments: cfg.codingStandards }), ...(d.kind === 'write' ? fieldProblems(soqlFields(path, text)) : [])]
+  return found.slice(0, 5).map((p) => note('✘ ' + (d.kind === 'write' ? 'line ' + p.line + '  ' : '') + p.problem, p.rule === 'schema' ? 'red' : 'yellow'))
+}
+
 function draftView($, d, Code, note) {
   const out = []
   const path = d.path ? absPath(d.path) : null
@@ -1447,7 +1627,7 @@ function draftView($, d, Code, note) {
       if (d.edits.length > 1) out.push(note('edit ' + (i + 1) + ' of ' + d.edits.length))
       if (diff.text) out.push(Code({ source: diff.text, format: 'diff', path: path ?? undefined, wrap: 'truncate-end' }))
     }
-    return out
+    return [...out, ...draftChecks(d, path, note)]
   }
   if (d.kind === 'write') {
     const base = path ? files.get(path)?.current : null
@@ -1461,13 +1641,23 @@ function draftView($, d, Code, note) {
     const t = tailLines(d.text, DRAFT_ROWS)
     const src = t.lines.join('\n') + (d.state === 'drafting' ? '█' : '')
     out.push(Code({ source: src || '█', path: path ?? undefined, startLine: t.first, wrap: 'truncate-end' }))
-    return out
+    return [...out, ...draftChecks(d, path, note)]
   }
   out.push(note(head))
   return out
 }
 
-function coverageView(sel, Code, note) {
+async function askForCoverage($, name, pct, lines) {
+  const test = TEST_NAME.test(name) ? name : name + 'Test'
+  const text = 'Write or extend Apex tests so ' + name + ' covers lines ' + ranges(lines) + ' (now ' + pct + '%). Read ' + name + ' first and test real behavior with assertions, not just line execution. Put the tests in ' + test + ', then run: sf apex run test --class-names ' + test + ' --code-coverage --json --wait 10'
+  try {
+    await $.prompt.submit({ text })
+  } catch (err) {
+    $.ui.toast('Could not send the prompt: ' + String(err?.message ?? err))
+  }
+}
+
+function coverageView($, sel, Code, Button, note) {
   const out = []
   const m = sel.path.match(/\/([^/]+)\.(cls|trigger)$/)
   if (!m) return [note('Coverage is shown for Apex classes and triggers.')]
@@ -1478,6 +1668,7 @@ function coverageView(sel, Code, note) {
   if (!lines) return [note(name + ': ' + pct + '% covered. Line detail needs --json output (sf apex run test … --code-coverage --json).')]
   if (lines.length === 0) return [note(name + ': ' + pct + '% covered, every line.', 'green')]
   out.push(note(name + ': ' + pct + '% · ' + plural(lines.length, 'uncovered line') + ': ' + ranges(lines), coverageColor(pct)))
+  out.push(Button({ key: 'files-cover', label: 'Ask Claude to cover these lines', hotkey: 't', plain: true, color: 'cyan', onPress: () => askForCoverage($, name, pct, lines) }))
   const src = typeof sel.current === 'string' ? splitLines(sel.current) : null
   if (!src) return out
   // each uncovered range with two lines of context
@@ -1704,7 +1895,7 @@ function renderFilesPane($, e) {
     if (sel.isFolder) detail.push(note('Folder deleted.', 'red'))
     else if (sel.binary) detail.push(note('Binary file: no preview.'))
     else if (sel.tooLarge) detail.push(note('Larger than 1 MB: listed without a preview.'))
-    else if (filesView === 'coverage') detail.push(...coverageView(sel, Code, note))
+    else if (filesView === 'coverage') detail.push(...coverageView($, sel, Code, Button, note))
     else if (filesView === 'latest') {
       if (sel.latestDiff) detail.push(code(sel.latestDiff, { format: 'diff' }))
       else if (sel.writing) detail.push(note('Writing…'))
@@ -1740,7 +1931,7 @@ function renderFilesPane($, e) {
     }
     // Problems in this file, under the view
     const probs = problemsFor(sel.path)
-    for (const p of probs.slice(0, 6)) detail.push(Text({ color: p.source === 'analyzer' ? 'yellow' : 'red', wrap: 'wrap', children: ['✘ ' + (p.line ? 'line ' + p.line + (p.col ? ':' + p.col : '') + '  ' : '') + p.problem] }))
+    for (const p of probs.slice(0, 6)) detail.push(Text({ color: problemColor(p), wrap: 'wrap', children: ['✘ ' + (p.line ? 'line ' + p.line + (p.col ? ':' + p.col : '') + '  ' : '') + p.problem] }))
     if (probs.length > 6) detail.push(note('and ' + (probs.length - 6) + ' more problems'))
   }
 
@@ -1754,8 +1945,8 @@ function renderFilesPane($, e) {
       const label = failureLine({ file: p.file, line: p.line, col: p.col, problem: p.problem })
       problemRows.push(
         target
-          ? Button({ key: 'problem-' + i, label: '✘ ' + label, plain: true, color: p.source === 'analyzer' ? 'yellow' : 'red', onPress: () => choose(target) })
-          : Text({ color: p.source === 'analyzer' ? 'yellow' : 'red', wrap: 'truncate', children: ['✘ ' + label] }),
+          ? Button({ key: 'problem-' + i, label: '✘ ' + label, plain: true, color: problemColor(p), onPress: () => choose(target) })
+          : Text({ color: problemColor(p), wrap: 'truncate', children: ['✘ ' + label] }),
       )
     })
     if (other.length > 5) problemRows.push(note('and ' + (other.length - 5) + ' more · a: ask Claude to fix'))
@@ -1843,7 +2034,7 @@ function renderSfPane($, e) {
     const probs = allProblems()
     if (probs.length) {
       body.push(Text({ children: [' '] }), Text({ bold: true, color: 'red', children: ['Problems'] }))
-      for (const p of probs.slice(0, 10)) body.push(Text({ color: p.source === 'analyzer' ? 'yellow' : 'red', wrap: 'truncate', children: ['✘ ' + failureLine(p)] }))
+      for (const p of probs.slice(0, 10)) body.push(Text({ color: problemColor(p), wrap: 'truncate', children: ['✘ ' + failureLine(p)] }))
       body.push(Button({ key: 'fix-problems', label: 'Ask Claude to fix (a)', hotkey: 'a', onPress: () => askClaudeToFix($) }))
     }
   } else if (sfTab === 'coverage') {
@@ -2067,12 +2258,29 @@ async function sfdoctor($, args) {
   // Unparsed outputs
   if (unparsed.count === 0) ok('No unparsed sf output this session')
   else warn(plural(unparsed.count, 'sf output') + ' could not be summarized this session', '/sfdoctor record saves the last one (cleaned) for a bug report')
+  if (cfg.codingStandards) ok('Coding standards on' + (cfg.namePrefix ? ' · new components need the ' + cfg.namePrefix + '_ prefix' : ' · no name prefix set'))
+  else warn('Coding standards off', 'Turn them on in /config')
   // Live typing
   if (!cfg.liveTyping) warn('Live typing is off', 'Turn it on in /config')
   else if (liveDisabled) warn('Live typing turned itself off after an error this session', 'Restart Claude Code; report it if it happens again')
   else ok('Live typing on')
   return 'SF Guardian doctor (' + (Date.now() - t0) + ' ms)\n' + rows.join('\n') + '\n\nSafe to paste into an issue: emails and org ids are not shown above, but check your org aliases.'
 }
+
+const TOOLS = [
+  {
+    name: 'describe_object',
+    description: 'Describe a Salesforce object in an org: every field with its API name, type, label, whether it is required, lookup targets and picklist values, plus child relationships. Use it before writing Apex, SOQL or LWC that references fields, instead of guessing field API names. Read only. org defaults to the default org.',
+    inputSchema: { type: 'object', properties: { object: { type: 'string', description: 'Object API name, such as Account or Invoice__c' }, org: { type: 'string', description: 'Org alias or username (optional)' } }, required: ['object'] },
+    isDeferred: false,
+  },
+  {
+    name: 'soql_query',
+    description: 'Run a read-only SOQL query in a Salesforce org and get the records as JSON. LIMIT 50 is added when the query has none, and limits above 200 are lowered to 200. On a production or unknown org the user is asked first. org defaults to the default org.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'A SELECT query' }, org: { type: 'string', description: 'Org alias or username (optional)' } }, required: ['query'] },
+    isDeferred: false,
+  },
+]
 
 // ── Hooks ───────────────────────────────────────────────────────────────────
 export function register(on, options) {
@@ -2109,6 +2317,13 @@ export function register(on, options) {
         // A command that can't register leaves the rest working
       }
     }
+    for (const t of TOOLS) {
+      try {
+        await $.tool.register(t)
+      } catch (err) {
+        $.ui.toast('SF Guardian could not add the ' + t.name + ' tool: ' + String(err?.message ?? err))
+      }
+    }
     void startOrgs($)
     defaultOrg = await readDefaultOrg($)
     await restoreFileList($)
@@ -2133,6 +2348,17 @@ export function register(on, options) {
     }
     return next(e)
   })
+
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    if (!cfg.codingStandards) return r
+    if (!project) await loadProject($)
+    if (!project?.found) return r
+    return { ...r, sections: [...r.sections, { id: 'sf-guardian:standards', text: standardsText(cfg.namePrefix), scope: 'session' }] }
+  })
+
+  on('tool.run', { tool: 'mcp__sf-guardian__describe_object' }, async ($, e) => describeTool($, e))
+  on('tool.run', { tool: 'mcp__sf-guardian__soql_query' }, async ($, e) => soqlTool($, e))
 
   on('session.end', async ($, e, next) => {
     try {
@@ -2184,6 +2410,9 @@ export function register(on, options) {
     if (mentionsAuthDir(cmd) && !(await guardAuthRead($, cmd))) {
       return { deny: 'The user did not allow reading Salesforce auth files (~/.sf, ~/.sfdx). Do not try to read them another way.' }
     }
+
+    const badName = generatedNameProblem(cmd)
+    if (badName) return { deny: badName }
 
     // The guard: every simple command, wrapped ones and scripts included
     const result = await judge($, cmd)
@@ -2300,6 +2529,11 @@ export function register(on, options) {
     }
 
     const id = e.tool_use_id
+    const badName = await newComponentProblem($, e.tool, typeof e.file_path === 'string' ? e.file_path : null)
+    if (badName) {
+      if (id) drafts.markDiscarded(id)
+      return { deny: badName }
+    }
     const draft = id ? drafts.markWriting(id) : null
     if (draft) $.ui.invalidate('ui.render')
     const target = typeof e.file_path === 'string' ? e.file_path : typeof e.notebook_path === 'string' ? e.notebook_path : null
@@ -2335,6 +2569,7 @@ export function register(on, options) {
     }
 
     if (changed) {
+      void ensureDescribes($)
       changedThisTurn.add(path)
       const m = path.match(/([^/]+)\.(cls|trigger)$/)
       if (m) {

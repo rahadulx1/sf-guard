@@ -6,6 +6,8 @@ import { classifyOrgs, daysUntil, needsAsk, orgClass, slimOrgList } from '../hoo
 import { applyDryRun, changesLogins, choicesFor, decide, questionFor } from '../hooks/lib/guard.js'
 import { metadataPathOf, parseAnalyzer, parseLimits, ranges, sampleOutput, sanitizeCommand, scrubSecrets, summarizeDeploy, summarizeTests } from '../hooks/lib/sf.js'
 import { unifiedDiff } from '../hooks/lib/diff.js'
+import { componentOf, lintSource, namingProblem, scanSource, soqlFields } from '../hooks/lib/lint.js'
+import { normalizePrefix, standardsText } from '../hooks/lib/standards.js'
 import { ANALYZER, APEX_FAIL, APEX_PASS, DEPLOY_FAIL, DEPLOY_OK, HUMAN_DEPLOY, LIMITS, ORG_LIST } from './fixtures/sf-output.js'
 
 // A deterministic random source, so a failure reproduces
@@ -371,5 +373,74 @@ describe('diff', () => {
   test('counts and focus', async () => {
     const d = unifiedDiff('a\nb\nc\n', 'a\nB\nc\nd\n')
     expect([d.adds, d.removes, d.first, d.last]).toEqual([2, 1, 2, 4])
+  })
+})
+
+describe('code checks', () => {
+  const CLS = '/p/force-app/main/default/classes/A.cls'
+  const rules = (text: string, noComments = false) => lintSource(CLS, text, { noComments }).map((p: any) => p.rule + ':' + p.line)
+  test('SOQL and DML in loops, not in the loop header', async () => {
+    const src = 'public with sharing class A {\n void r() {\n  for (Account a : [SELECT Id FROM Account]) {\n   insert new Contact();\n   Database.update(a);\n  }\n  while (x) update y;\n  do { delete z; } while (q);\n }\n}'
+    expect(rules(src)).toEqual(['dml-in-loop:4', 'dml-in-loop:5', 'dml-in-loop:7', 'dml-in-loop:8'])
+  })
+  test('strings and comments do not count as code', async () => {
+    expect(rules("public with sharing class A {\n String q = 'for (x) { [SELECT Id FROM A] }';\n}")).toEqual([])
+  })
+  test('comments only when the standards are on; tool directives are kept', async () => {
+    const src = 'public with sharing class A {\n // x\n /* y */\n // NOPMD\n}'
+    expect(rules(src)).toEqual([])
+    expect(rules(src, true)).toEqual(['no-comments:2', 'no-comments:3'])
+  })
+  test('hard-coded ids, sharing, debug; test classes skip sharing and debug', async () => {
+    expect(rules("public class A {\n Id x = '0015g00000AbCdE';\n void m() { System.debug(x); }\n}")).toEqual(['sharing:1', 'hardcoded-id:2', 'debug:3'])
+    expect(rules('@IsTest\nprivate class ATest {\n static void t() { System.debug(1); }\n}')).toEqual([])
+    expect(rules('public inherited sharing class A {}')).toEqual([])
+  })
+  test('LWC JavaScript and HTML comments', async () => {
+    expect(lintSource('/p/lwc/c/c.js', 'const a = "//no"; // yes', { noComments: true }).length).toBe(1)
+    expect(lintSource('/p/lwc/c/c.html', '<template><!-- x --></template>', { noComments: true }).length).toBe(1)
+    expect(lintSource('/p/README.md', '// x', { noComments: true })).toEqual([])
+  })
+  test('scanSource keeps line numbers', async () => {
+    expect(scanSource("a /* x\ny */ 'b\nc'", 'apex').code.split('\n').length).toBe(3)
+  })
+  test('SOQL fields with their object and line', async () => {
+    expect(soqlFields(CLS, 'x\n[SELECT Id, Name, Owner.Name, (SELECT Id FROM Contacts), COUNT() FROM Account]')).toEqual([
+      { object: 'Account', field: 'Id', line: 2 },
+      { object: 'Account', field: 'Name', line: 2 },
+    ])
+  })
+})
+
+describe('component names', () => {
+  const cases: [string, string, string | null][] = [
+    ['class', 'INV_ContractRequestService', null],
+    ['class', 'INV_ContractRequestServiceTest', null],
+    ['trigger', 'INV_ContractRequestTrigger', null],
+    ['lwc', 'inv_contractRequestForm', null],
+    ['class', 'ContractRequestService', 'INV_ContractRequestService'],
+    ['class', 'INV__Service', 'INV_Service'],
+    ['class', 'INV_Service_', 'INV_Service'],
+    ['class', 'INV_service', 'INV_Service'],
+    ['lwc', 'contractRequestForm', 'inv_contractRequestForm'],
+    ['lwc', 'INV_ContractRequestForm', 'inv_contractRequestForm'],
+  ]
+  for (const [kind, name, fix] of cases) {
+    test(kind + ' ' + name, async () => {
+      const p = namingProblem(kind, name, 'INV')
+      if (fix === null) expect(p).toBe(null)
+      else expect(p).toMatch(new RegExp('to ' + fix + '\\.$'))
+    })
+  }
+  test('which paths are components', async () => {
+    expect(componentOf('/p/force-app/main/default/classes/X.cls-meta.xml')).toEqual({ kind: 'class', name: 'X' })
+    expect(componentOf('/p/force-app/main/default/triggers/T.trigger')).toEqual({ kind: 'trigger', name: 'T' })
+    expect(componentOf('/p/force-app/main/default/lwc/inv_card/inv_card.html')).toEqual({ kind: 'lwc', name: 'inv_card', folder: '/p/force-app/main/default/lwc/inv_card' })
+    expect(componentOf('/p/force-app/main/default/objects/A/A.object-meta.xml')).toBe(null)
+  })
+  test('the prefix setting is cleaned', async () => {
+    expect([normalizePrefix('inv'), normalizePrefix('INV_'), normalizePrefix(' '), normalizePrefix('in v'), normalizePrefix('1X')]).toEqual(['INV', 'INV', '', '', ''])
+    expect(standardsText('')).not.toMatch(/Component Naming Prefix/)
+    expect(standardsText('ACME')).toMatch(/ACME_ContractRequestService/)
   })
 })
